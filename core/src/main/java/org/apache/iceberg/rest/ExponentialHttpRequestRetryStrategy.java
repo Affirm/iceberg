@@ -65,10 +65,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
  * </ul>
  *
  * The following retriable HTTP status codes are defined for idempotent requests:
-<<<<<<< HEAD
- *
-=======
->>>>>>> 4c08be5c6 (Core: Allow retries for Idempotent Requests with Certain Codes)
  * <ul>
  *   <li>SC_TOO_MANY_REQUESTS (429)
  *   <li>SC_SERVICE_UNAVAILABLE (503)
