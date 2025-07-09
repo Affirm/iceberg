@@ -94,7 +94,6 @@ class ExponentialHttpRequestRetryStrategy implements HttpRequestRetryStrategy {
     this.idempotentRetriableCodes =
         ImmutableSet.of(
           HttpStatus.SC_TOO_MANY_REQUESTS,
-          HttpStatus.SC_SERVICE_UNAVAILABLE,
           HttpStatus.SC_INTERNAL_SERVER_ERROR,
           HttpStatus.SC_SERVICE_UNAVAILABLE,
           HttpStatus.SC_BAD_GATEWAY,
@@ -162,7 +161,8 @@ class ExponentialHttpRequestRetryStrategy implements HttpRequestRetryStrategy {
       try {
         retryAfter = TimeValue.ofSeconds(Long.parseLong(value));
       } catch (NumberFormatException ignore) {
-        Instant retryAfterDate = DateUtils.parseStandardDate(value); if (retryAfterDate != null) {
+        Instant retryAfterDate = DateUtils.parseStandardDate(value);
+        if (retryAfterDate != null) {
           retryAfter =
               TimeValue.ofMilliseconds(retryAfterDate.toEpochMilli() - System.currentTimeMillis());
         }
