@@ -236,6 +236,17 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
       commitDeltaTxn(table, branch, pendingResults, newFlinkJobId, operatorId);
     }
 
+    LOG.info(
+        "Committed offsets (checkpointIds): {} for table: {}, branch: {}",
+        pendingResults.navigableKeySet(),
+        table.name(),
+        branch);
+    if (committerMetrics != null) {
+      CommitSummary summary = new CommitSummary();
+      summary.addAll(pendingResults);
+      committerMetrics.updateCommitSummary(table.name(), summary);
+    }
+
     FlinkManifestUtil.deleteCommittedManifests(table, manifests, newFlinkJobId, checkpointId);
   }
 
@@ -380,12 +391,15 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
     }
 
     long durationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNano);
+    table.refresh();
+    Snapshot snapshot = table.snapshot(branch);
     LOG.info(
-        "Committed {} to table: {}, branch: {}, checkpointId {} in {} ms",
+        "Committed {} to table: {}, branch: {}, checkpointId: {}, snapshotId: {} in {} ms",
         description,
         table.name(),
         branch,
         checkpointId,
+        snapshot != null ? snapshot.snapshotId() : "N/A",
         durationMs);
     if (committerMetrics != null) {
       committerMetrics.commitDuration(table.name(), durationMs);

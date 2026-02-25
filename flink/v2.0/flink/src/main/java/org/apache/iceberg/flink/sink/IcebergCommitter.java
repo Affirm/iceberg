@@ -32,6 +32,7 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ReplacePartitions;
 import org.apache.iceberg.RowDelta;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.flink.TableLoader;
@@ -173,6 +174,11 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
 
     CommitSummary summary = new CommitSummary(pendingResults);
     commitPendingResult(pendingResults, summary, newFlinkJobId, operatorId);
+    LOG.info(
+        "Committed offsets (checkpointIds): {} for table: {}, branch: {}",
+        pendingResults.navigableKeySet(),
+        table.name(),
+        branch);
     if (committerMetrics != null) {
       committerMetrics.updateCommitSummary(summary);
     }
@@ -297,12 +303,15 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
     long startNano = System.nanoTime();
     operation.commit(); // abort is automatically called if this fails.
     long durationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNano);
+    table.refresh();
+    Snapshot snapshot = table.snapshot(branch);
     LOG.info(
-        "Committed {} to table: {}, branch: {}, checkpointId {} in {} ms",
+        "Committed {} to table: {}, branch: {}, checkpointId: {}, snapshotId: {} in {} ms",
         description,
         table.name(),
         branch,
         checkpointId,
+        snapshot != null ? snapshot.snapshotId() : "N/A",
         durationMs);
     if (committerMetrics != null) {
       committerMetrics.commitDuration(durationMs);
