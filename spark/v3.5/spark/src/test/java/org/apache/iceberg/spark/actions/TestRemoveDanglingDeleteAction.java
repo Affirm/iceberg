@@ -20,9 +20,9 @@ package org.apache.iceberg.spark.actions;
 
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.File;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -33,6 +33,7 @@ import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileGenerationUtil;
 import org.apache.iceberg.FileMetadata;
+import org.apache.iceberg.Metrics;
 import org.apache.iceberg.Parameter;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
@@ -40,11 +41,14 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.TestHelpers;
 import org.apache.iceberg.actions.RemoveDanglingDeleteFiles;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.TestBase;
+import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.Encoders;
 import org.junit.jupiter.api.AfterEach;
@@ -75,24 +79,44 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
           .build();
   static final DataFile FILE_A2 =
       DataFiles.builder(SPEC)
-          .withPath("/path/to/data-a.parquet")
+          .withPath("/path/to/data-a2.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=a") // easy way to set partition data for now
           .withRecordCount(1)
           .build();
+  static final Metrics FILE_B_METRICS =
+      new Metrics(
+          1L,
+          null,
+          ImmutableMap.of(2, 1L),
+          ImmutableMap.of(2, 0L),
+          null,
+          ImmutableMap.of(2, Conversions.toByteBuffer(Types.StringType.get(), "a")),
+          ImmutableMap.of(2, Conversions.toByteBuffer(Types.StringType.get(), "a")));
   static final DataFile FILE_B =
       DataFiles.builder(SPEC)
           .withPath("/path/to/data-b.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=b") // easy way to set partition data for now
           .withRecordCount(1)
+          .withMetrics(FILE_B_METRICS)
           .build();
+  static final Metrics FILE_B2_METRICS =
+      new Metrics(
+          1L,
+          null,
+          ImmutableMap.of(2, 1L),
+          ImmutableMap.of(2, 0L),
+          null,
+          ImmutableMap.of(2, Conversions.toByteBuffer(Types.StringType.get(), "b")),
+          ImmutableMap.of(2, Conversions.toByteBuffer(Types.StringType.get(), "b")));
   static final DataFile FILE_B2 =
       DataFiles.builder(SPEC)
-          .withPath("/path/to/data-b.parquet")
+          .withPath("/path/to/data-b2.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=b") // easy way to set partition data for now
           .withRecordCount(1)
+          .withMetrics(FILE_B2_METRICS)
           .build();
   static final DataFile FILE_C =
       DataFiles.builder(SPEC)
@@ -103,7 +127,7 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
           .build();
   static final DataFile FILE_C2 =
       DataFiles.builder(SPEC)
-          .withPath("/path/to/data-c.parquet")
+          .withPath("/path/to/data-c2.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=c") // easy way to set partition data for now
           .withRecordCount(1)
@@ -117,7 +141,7 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
           .build();
   static final DataFile FILE_D2 =
       DataFiles.builder(SPEC)
-          .withPath("/path/to/data-d.parquet")
+          .withPath("/path/to/data-d2.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=d") // easy way to set partition data for now
           .withRecordCount(1)
@@ -172,19 +196,21 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
           .build();
   static final DeleteFile FILE_B_EQ_DELETES =
       FileMetadata.deleteFileBuilder(SPEC)
-          .ofEqualityDeletes()
+          .ofEqualityDeletes(2)
           .withPath("/path/to/data-b-eq-deletes.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=b") // easy way to set partition data for now
           .withRecordCount(1)
+          .withMetrics(FILE_B_METRICS)
           .build();
   static final DeleteFile FILE_B2_EQ_DELETES =
       FileMetadata.deleteFileBuilder(SPEC)
-          .ofEqualityDeletes()
+          .ofEqualityDeletes(2)
           .withPath("/path/to/data-b2-eq-deletes.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=b") // easy way to set partition data for now
           .withRecordCount(1)
+          .withMetrics(FILE_B2_METRICS)
           .build();
 
   static final DataFile FILE_UNPARTITIONED =
@@ -212,8 +238,8 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
   @Parameter private int formatVersion;
 
   @Parameters(name = "formatVersion = {0}")
-  protected static List<Object> parameters() {
-    return Arrays.asList(2, 3);
+  protected static List<Integer> parameters() {
+    return TestHelpers.V2_AND_ABOVE;
   }
 
   private String tableLocation = null;
@@ -302,15 +328,7 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
         .appendFile(FILE_D2)
         .commit();
 
-    List<Tuple2<Long, String>> actual =
-        spark
-            .read()
-            .format("iceberg")
-            .load(tableLocation + "#entries")
-            .select("sequence_number", "data_file.file_path")
-            .sort("sequence_number", "data_file.file_path")
-            .as(Encoders.tuple(Encoders.LONG(), Encoders.STRING()))
-            .collectAsList();
+    List<Tuple2<Long, String>> actual = allEntries();
     List<Tuple2<Long, String>> expected =
         ImmutableList.of(
             Tuple2.apply(1L, FILE_B.location()),
@@ -334,44 +352,63 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
         SparkActions.get().removeDanglingDeleteFiles(table).execute();
 
     // All Delete files of the FILE A partition should be removed
+    // because there are no data files in partition with a lesser sequence number.
+    // In version 3+, the DV file of FILE B2 should be removed
+    // because the DV file's sequence number is less than the data file's.
+    // The second equality delete of FILE B should be removed
     // because there are no data files in partition with a lesser sequence number
+    // and overlapping lower/upper bounds.
 
     Set<CharSequence> removedDeleteFiles =
         StreamSupport.stream(result.removedDeleteFiles().spliterator(), false)
             .map(DeleteFile::location)
             .collect(Collectors.toSet());
-    assertThat(removedDeleteFiles)
-        .as("Expected 4 delete files removed")
-        .hasSize(4)
-        .containsExactlyInAnyOrder(
-            fileADeletes.location(),
-            fileA2Deletes.location(),
-            FILE_A_EQ_DELETES.location(),
-            FILE_A2_EQ_DELETES.location());
-
-    List<Tuple2<Long, String>> actualAfter =
-        spark
-            .read()
-            .format("iceberg")
-            .load(tableLocation + "#entries")
-            .filter("status < 2") // live files
-            .select("sequence_number", "data_file.file_path")
-            .sort("sequence_number", "data_file.file_path")
-            .as(Encoders.tuple(Encoders.LONG(), Encoders.STRING()))
-            .collectAsList();
+    if (formatVersion < 3) {
+      assertThat(removedDeleteFiles)
+          .as("Expected 5 delete files removed")
+          .hasSize(5)
+          .containsExactlyInAnyOrder(
+              fileADeletes.location(),
+              fileA2Deletes.location(),
+              FILE_A_EQ_DELETES.location(),
+              FILE_A2_EQ_DELETES.location(),
+              FILE_B2_EQ_DELETES.location());
+    } else {
+      assertThat(removedDeleteFiles)
+          .as("Expected 6 delete files removed")
+          .hasSize(6)
+          .containsExactlyInAnyOrder(
+              fileADeletes.location(),
+              fileA2Deletes.location(),
+              FILE_A_EQ_DELETES.location(),
+              FILE_A2_EQ_DELETES.location(),
+              fileB2Deletes.location(),
+              FILE_B2_EQ_DELETES.location());
+    }
+    List<Tuple2<Long, String>> actualAfter = liveEntries();
     List<Tuple2<Long, String>> expectedAfter =
-        ImmutableList.of(
-            Tuple2.apply(1L, FILE_B.location()),
-            Tuple2.apply(1L, FILE_C.location()),
-            Tuple2.apply(1L, FILE_D.location()),
-            Tuple2.apply(2L, FILE_B_EQ_DELETES.location()),
-            Tuple2.apply(2L, fileBDeletes.location()),
-            Tuple2.apply(2L, FILE_B2_EQ_DELETES.location()),
-            Tuple2.apply(2L, fileB2Deletes.location()),
-            Tuple2.apply(3L, FILE_A2.location()),
-            Tuple2.apply(3L, FILE_B2.location()),
-            Tuple2.apply(3L, FILE_C2.location()),
-            Tuple2.apply(3L, FILE_D2.location()));
+        formatVersion < 3
+            ? ImmutableList.of(
+                Tuple2.apply(1L, FILE_B.location()),
+                Tuple2.apply(1L, FILE_C.location()),
+                Tuple2.apply(1L, FILE_D.location()),
+                Tuple2.apply(2L, FILE_B_EQ_DELETES.location()),
+                Tuple2.apply(2L, fileBDeletes.location()),
+                Tuple2.apply(2L, fileB2Deletes.location()),
+                Tuple2.apply(3L, FILE_A2.location()),
+                Tuple2.apply(3L, FILE_B2.location()),
+                Tuple2.apply(3L, FILE_C2.location()),
+                Tuple2.apply(3L, FILE_D2.location()))
+            : ImmutableList.of(
+                Tuple2.apply(1L, FILE_B.location()),
+                Tuple2.apply(1L, FILE_C.location()),
+                Tuple2.apply(1L, FILE_D.location()),
+                Tuple2.apply(2L, FILE_B_EQ_DELETES.location()),
+                Tuple2.apply(2L, fileBDeletes.location()),
+                Tuple2.apply(3L, FILE_A2.location()),
+                Tuple2.apply(3L, FILE_B2.location()),
+                Tuple2.apply(3L, FILE_C2.location()),
+                Tuple2.apply(3L, FILE_D2.location()));
     assertThat(actualAfter).containsExactlyInAnyOrderElementsOf(expectedAfter);
   }
 
@@ -385,7 +422,6 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
     // Add Data Files with EQ and POS deletes
     DeleteFile fileADeletes = fileADeletes();
     DeleteFile fileA2Deletes = fileA2Deletes();
-    DeleteFile fileBDeletes = fileBDeletes();
     DeleteFile fileB2Deletes = fileB2Deletes();
     table
         .newRowDelta()
@@ -397,21 +433,12 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
         .addDeletes(fileA2Deletes)
         .addDeletes(FILE_A_EQ_DELETES)
         .addDeletes(FILE_A2_EQ_DELETES)
-        .addDeletes(fileBDeletes)
         .addDeletes(fileB2Deletes)
         .addDeletes(FILE_B_EQ_DELETES)
         .addDeletes(FILE_B2_EQ_DELETES)
         .commit();
 
-    List<Tuple2<Long, String>> actual =
-        spark
-            .read()
-            .format("iceberg")
-            .load(tableLocation + "#entries")
-            .select("sequence_number", "data_file.file_path")
-            .sort("sequence_number", "data_file.file_path")
-            .as(Encoders.tuple(Encoders.LONG(), Encoders.STRING()))
-            .collectAsList();
+    List<Tuple2<Long, String>> actual = allEntries();
     List<Tuple2<Long, String>> expected =
         ImmutableList.of(
             Tuple2.apply(1L, FILE_A.location()),
@@ -423,7 +450,6 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
             Tuple2.apply(2L, FILE_A2_EQ_DELETES.location()),
             Tuple2.apply(2L, fileA2Deletes.location()),
             Tuple2.apply(2L, FILE_B_EQ_DELETES.location()),
-            Tuple2.apply(2L, fileBDeletes.location()),
             Tuple2.apply(2L, FILE_B2.location()),
             Tuple2.apply(2L, FILE_B2_EQ_DELETES.location()),
             Tuple2.apply(2L, fileB2Deletes.location()),
@@ -445,16 +471,7 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
         .hasSize(2)
         .containsExactlyInAnyOrder(FILE_B_EQ_DELETES.location(), FILE_B2_EQ_DELETES.location());
 
-    List<Tuple2<Long, String>> actualAfter =
-        spark
-            .read()
-            .format("iceberg")
-            .load(tableLocation + "#entries")
-            .filter("status < 2") // live files
-            .select("sequence_number", "data_file.file_path")
-            .sort("sequence_number", "data_file.file_path")
-            .as(Encoders.tuple(Encoders.LONG(), Encoders.STRING()))
-            .collectAsList();
+    List<Tuple2<Long, String>> actualAfter = liveEntries();
     List<Tuple2<Long, String>> expectedAfter =
         ImmutableList.of(
             Tuple2.apply(1L, FILE_A.location()),
@@ -465,7 +482,6 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
             Tuple2.apply(2L, FILE_A2.location()),
             Tuple2.apply(2L, FILE_A2_EQ_DELETES.location()),
             Tuple2.apply(2L, fileA2Deletes.location()),
-            Tuple2.apply(2L, fileBDeletes.location()),
             Tuple2.apply(2L, FILE_B2.location()),
             Tuple2.apply(2L, fileB2Deletes.location()),
             Tuple2.apply(2L, FILE_C2.location()),
@@ -477,15 +493,100 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
   public void testUnpartitionedTable() {
     setupUnpartitionedTable();
 
-    table
-        .newRowDelta()
-        .addDeletes(fileUnpartitionedDeletes())
-        .addDeletes(FILE_UNPARTITIONED_EQ_DELETE)
-        .commit();
+    DeleteFile posDelete = fileUnpartitionedDeletes();
+    table.newRowDelta().addDeletes(posDelete).addDeletes(FILE_UNPARTITIONED_EQ_DELETE).commit();
     table.newAppend().appendFile(FILE_UNPARTITIONED).commit();
 
     RemoveDanglingDeleteFiles.Result result =
         SparkActions.get().removeDanglingDeleteFiles(table).execute();
-    assertThat(result.removedDeleteFiles()).as("No-op for unpartitioned tables").isEmpty();
+    Set<CharSequence> removed =
+        StreamSupport.stream(result.removedDeleteFiles().spliterator(), false)
+            .map(DeleteFile::location)
+            .collect(Collectors.toSet());
+    assertThat(removed)
+        .as("Expected 2 delete files removed")
+        .hasSize(2)
+        .containsExactlyInAnyOrder(posDelete.location(), FILE_UNPARTITIONED_EQ_DELETE.location());
+  }
+
+  @TestTemplate
+  public void testPartitionedDeletesWithDanglingDvs() {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(3);
+    setupPartitionedTable();
+
+    table.newAppend().appendFile(FILE_A).appendFile(FILE_C).appendFile(FILE_D).commit();
+
+    DeleteFile fileADeletes = fileADeletes();
+    DeleteFile fileBDeletes = fileBDeletes();
+    DeleteFile fileB2Deletes = fileB2Deletes();
+    table
+        .newRowDelta()
+        .addRows(FILE_A)
+        .addRows(FILE_C)
+        .addDeletes(fileADeletes)
+        // since FILE B doesn't exist, these delete files will be dangling
+        .addDeletes(fileBDeletes)
+        .addDeletes(fileB2Deletes)
+        .commit();
+
+    List<Tuple2<Long, String>> actual = allEntries();
+    List<Tuple2<Long, String>> expected =
+        ImmutableList.of(
+            Tuple2.apply(1L, FILE_A.location()),
+            Tuple2.apply(1L, FILE_C.location()),
+            Tuple2.apply(1L, FILE_D.location()),
+            Tuple2.apply(2L, FILE_A.location()),
+            Tuple2.apply(2L, FILE_C.location()),
+            Tuple2.apply(2L, fileB2Deletes.location()),
+            Tuple2.apply(2L, fileBDeletes.location()),
+            Tuple2.apply(2L, fileADeletes.location()));
+    assertThat(actual).containsExactlyInAnyOrderElementsOf(expected);
+
+    RemoveDanglingDeleteFiles.Result result =
+        SparkActions.get().removeDanglingDeleteFiles(table).execute();
+
+    // DVs of FILE B should be removed because they don't point to valid data files
+    Set<CharSequence> removedDeleteFiles =
+        Lists.newArrayList(result.removedDeleteFiles()).stream()
+            .map(DeleteFile::location)
+            .collect(Collectors.toSet());
+    assertThat(removedDeleteFiles)
+        .as("Expected two delete files to be removed")
+        .hasSize(2)
+        .containsExactlyInAnyOrder(fileBDeletes.location(), fileB2Deletes.location());
+
+    List<Tuple2<Long, String>> actualAfter = liveEntries();
+    List<Tuple2<Long, String>> expectedAfter =
+        ImmutableList.of(
+            Tuple2.apply(1L, FILE_A.location()),
+            Tuple2.apply(1L, FILE_C.location()),
+            Tuple2.apply(1L, FILE_D.location()),
+            Tuple2.apply(2L, FILE_A.location()),
+            Tuple2.apply(2L, FILE_C.location()),
+            Tuple2.apply(2L, fileADeletes.location()));
+    assertThat(actualAfter).containsExactlyInAnyOrderElementsOf(expectedAfter);
+  }
+
+  private List<Tuple2<Long, String>> liveEntries() {
+    return spark
+        .read()
+        .format("iceberg")
+        .load(tableLocation + "#entries")
+        .filter("status < 2") // live files
+        .select("sequence_number", "data_file.file_path")
+        .sort("sequence_number", "data_file.file_path")
+        .as(Encoders.tuple(Encoders.LONG(), Encoders.STRING()))
+        .collectAsList();
+  }
+
+  private List<Tuple2<Long, String>> allEntries() {
+    return spark
+        .read()
+        .format("iceberg")
+        .load(tableLocation + "#entries")
+        .select("sequence_number", "data_file.file_path")
+        .sort("sequence_number", "data_file.file_path")
+        .as(Encoders.tuple(Encoders.LONG(), Encoders.STRING()))
+        .collectAsList();
   }
 }
