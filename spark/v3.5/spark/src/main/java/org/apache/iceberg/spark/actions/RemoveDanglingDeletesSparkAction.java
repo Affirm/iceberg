@@ -101,12 +101,20 @@ class RemoveDanglingDeletesSparkAction
 
     // AFFIRM: resolve the snapshot once and guard against null. Upstream calls scan.snapshot()
     // inline below, which NPEs on a table with no current snapshot (reachable via a direct
-    // SparkActions.get().removeDanglingDeleteFiles(table) call). Resolving once also pins both
-    // the scan and the manifest read to the same snapshot.
+    // SparkActions.get().removeDanglingDeleteFiles(table) call).
     Snapshot snapshot = scan.snapshot();
     if (snapshot == null) {
       return Collections.emptyList();
     }
+
+    // AFFIRM: pin the scan itself to the resolved snapshot ID rather than relying on
+    // TableScan#snapshot() being called before TableScan#planFiles() below. TableScan#snapshot()
+    // re-resolves table().currentSnapshot() on every call (SnapshotScan.java), so without this
+    // pin, a commit landing between the two calls could make planFiles() plan against a *newer*
+    // snapshot than the one whose delete manifests we read further down -- silently correct today
+    // only because of statement order, and one reordering away from misclassifying a still-live
+    // delete file as dangling.
+    scan = scan.useSnapshot(snapshot.snapshotId());
 
     DeleteFileSet deletes = DeleteFileSet.create();
     try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {

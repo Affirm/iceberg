@@ -663,6 +663,52 @@ public class TestRewriteDataFilesAction extends TestBase {
   }
 
   @TestTemplate
+  public void testRemoveDanglingDeletesWhenNoRewriteGroupSelected() {
+    // AFFIRM: covers the fix in RewriteDataFilesSparkAction#execute() -- when ctx.totalGroupCount()
+    // == 0, dangling delete removal must still run instead of returning EMPTY_RESULT. This is the
+    // stuck state a real prod table can get permanently wedged in: if every remaining data file
+    // sits in a single-file group, SizeBasedDataRewriter.enoughInputFiles()/enoughContent() both
+    // require more than one file per group, so no group is ever selected for rewrite -- and this
+    // early return used to skip dangling-delete cleanup forever as a result.
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            SPEC,
+            ImmutableMap.of(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion)),
+            tableLocation);
+
+    // A single file in partition c1=1. SizeBasedDataRewriter bins it as its own one-file group,
+    // and a one-file group can never satisfy enoughInputFiles/enoughContent (both require more
+    // than one file) or the delete-based criteria (no deletes attached here) -- so filtering the
+    // rewrite to this partition alone yields zero rewrite groups.
+    writeRecords(Lists.newArrayList(new ThreeColumnRecord(1, "AAAAAAAAAA", "AAAA")));
+    shouldHaveFiles(table, 1);
+
+    // A genuinely dangling equality delete in a partition (c1=2) that never receives any data
+    // file. Dangling from the moment it's written -- the same "born dangling" shape as the prod
+    // bug -- and, crucially, outside the rewrite filter below, so it can only be swept by the
+    // dangling-delete removal step itself, not by ordinary rewrite planning.
+    writeEqDeleteRecord(table, "c1", 2, "c3", "ZZZZ");
+    table.refresh();
+    assertThat(TestHelpers.deleteFiles(table)).as("One dangling equality delete exists").hasSize(1);
+
+    Result result =
+        actions()
+            .rewriteDataFiles(table)
+            .filter(Expressions.equal("c1", 1))
+            .option(RewriteDataFiles.REMOVE_DANGLING_DELETES, "true")
+            .execute();
+
+    assertThat(result.rewrittenDataFilesCount())
+        .as("No data files should be rewritten -- the single file in c1=1 isn't a rewrite candidate")
+        .isEqualTo(0);
+    assertThat(result.removedDeleteFilesCount())
+        .as("The dangling delete in c1=2 must still be removed on the zero-rewrite-groups path")
+        .isEqualTo(1);
+    assertThat(TestHelpers.deleteFiles(table)).as("No delete files remain").isEmpty();
+  }
+
+  @TestTemplate
   public void testBinPackWithDeleteAllData() throws IOException {
     assumeThat(formatVersion).isGreaterThanOrEqualTo(2);
     Table table = createTablePartitioned(1, 1, 1);
