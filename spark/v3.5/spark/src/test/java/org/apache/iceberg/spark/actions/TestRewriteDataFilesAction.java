@@ -690,7 +690,9 @@ public class TestRewriteDataFilesAction extends TestBase {
     // dangling-delete removal step itself, not by ordinary rewrite planning.
     writeEqDeleteRecord(table, "c1", 2, "c3", "ZZZZ");
     table.refresh();
-    assertThat(TestHelpers.deleteFiles(table)).as("One dangling equality delete exists").hasSize(1);
+    assertThat(deleteFileEntryCount())
+        .as("One dangling equality delete exists in the manifests")
+        .isEqualTo(1);
 
     Result result =
         actions()
@@ -700,12 +702,30 @@ public class TestRewriteDataFilesAction extends TestBase {
             .execute();
 
     assertThat(result.rewrittenDataFilesCount())
-        .as("No data files should be rewritten -- the single file in c1=1 isn't a rewrite candidate")
+        .as(
+            "No data files should be rewritten -- the single file in c1=1 isn't a rewrite candidate")
         .isEqualTo(0);
     assertThat(result.removedDeleteFilesCount())
         .as("The dangling delete in c1=2 must still be removed on the zero-rewrite-groups path")
         .isEqualTo(1);
-    assertThat(TestHelpers.deleteFiles(table)).as("No delete files remain").isEmpty();
+    assertThat(deleteFileEntryCount()).as("No delete files remain in the manifests").isZero();
+  }
+
+  /**
+   * Counts live delete-file entries in the table's manifests.
+   *
+   * <p>Deliberately not {@code TestHelpers.deleteFiles(table)}: that unions {@code
+   * FileScanTask#deletes()} over a scan, which is the set of deletes a reader would apply -- a
+   * dangling delete file is by definition absent from it. Reading {@code #entries} instead sees
+   * every delete file present in the manifests, dangling or not.
+   */
+  private long deleteFileEntryCount() {
+    return spark
+        .read()
+        .format("iceberg")
+        .load(tableLocation + "#entries")
+        .filter("data_file.content != 0 AND status < 2")
+        .count();
   }
 
   @TestTemplate

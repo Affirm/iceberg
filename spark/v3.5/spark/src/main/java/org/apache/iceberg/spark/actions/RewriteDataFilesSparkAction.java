@@ -209,8 +209,7 @@ public class RewriteDataFilesSparkAction
    * return path above, not just after a successful data rewrite.
    */
   private RewriteDataFiles.Result removeDanglingDeletesAndBuild(Builder resultBuilder) {
-    RemoveDanglingDeletesSparkAction action =
-        new RemoveDanglingDeletesSparkAction(spark(), table);
+    RemoveDanglingDeletesSparkAction action = new RemoveDanglingDeletesSparkAction(spark(), table);
     int removedCount = Iterables.size(action.execute().removedDeleteFiles());
     resultBuilder.removedDeleteFilesCount(removedCount);
     return resultBuilder.build();
