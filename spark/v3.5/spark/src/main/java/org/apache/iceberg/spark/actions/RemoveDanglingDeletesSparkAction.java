@@ -131,7 +131,11 @@ class RemoveDanglingDeletesSparkAction
           ManifestFiles.readDeleteManifest(manifest, table.io(), table.specs())) {
         for (DeleteFile deleteFile : reader) {
           if (!deletes.contains(deleteFile)) {
-            danglingDeletes.add(deleteFile);
+            // AFFIRM: drop column stats before retaining. DeleteFileSet keys on location,
+            // contentOffset and contentSizeInBytes, all of which copyWithoutStats() preserves,
+            // and nothing on the rewrite path reads a metrics map -- so holding lower/upper
+            // bounds for every dangling delete is pure driver heap.
+            danglingDeletes.add(deleteFile.copyWithoutStats());
           }
         }
       } catch (IOException e) {

@@ -567,6 +567,81 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
     assertThat(actualAfter).containsExactlyInAnyOrderElementsOf(expectedAfter);
   }
 
+  @TestTemplate
+  public void testRemovedDeleteFilesDropColumnStats() {
+    setupPartitionedTable();
+
+    // FILE_B carries c2 bounds "a"-"a".
+    table.newAppend().appendFile(FILE_B).commit();
+
+    // FILE_B_EQ_DELETES (bounds "a"-"a") applies to FILE_B and must be kept.
+    // FILE_B2_EQ_DELETES (bounds "b"-"b") and the FILE_A deletes are dangling.
+    DeleteFile fileADeletes = fileADeletes();
+    table
+        .newRowDelta()
+        .addDeletes(fileADeletes)
+        .addDeletes(FILE_B_EQ_DELETES)
+        .addDeletes(FILE_B2_EQ_DELETES)
+        .commit();
+
+    // FILE_B2 is the only data file whose values overlap FILE_B2_EQ_DELETES, and it lands at a
+    // higher sequence number, so that delete can never apply.
+    table.newAppend().appendFile(FILE_B2).commit();
+
+    RemoveDanglingDeleteFiles.Result result =
+        SparkActions.get().removeDanglingDeleteFiles(table).execute();
+
+    Set<CharSequence> removedLocations =
+        StreamSupport.stream(result.removedDeleteFiles().spliterator(), false)
+            .map(DeleteFile::location)
+            .collect(Collectors.toSet());
+    assertThat(removedLocations)
+        .as("Stripping stats must not change which files are classified as dangling")
+        .containsExactlyInAnyOrder(fileADeletes.location(), FILE_B2_EQ_DELETES.location());
+
+    // Every returned delete file is a copyWithoutStats() copy, so no metrics map survives. Held
+    // for every dangling delete, these are what dominated driver heap on large delete backlogs.
+    for (DeleteFile removed : result.removedDeleteFiles()) {
+      assertThat(removed.columnSizes()).isNull();
+      assertThat(removed.valueCounts()).isNull();
+      assertThat(removed.nullValueCounts()).isNull();
+      assertThat(removed.nanValueCounts()).isNull();
+      assertThat(removed.lowerBounds()).isNull();
+      assertThat(removed.upperBounds()).isNull();
+    }
+
+    // Fields the rewrite path and DeleteFileSet identity depend on must survive the copy.
+    DeleteFile removedEqDeletes = null;
+    DeleteFile removedFileADeletes = null;
+    for (DeleteFile removed : result.removedDeleteFiles()) {
+      if (removed.location().equals(FILE_B2_EQ_DELETES.location())) {
+        removedEqDeletes = removed;
+      } else if (removed.location().equals(fileADeletes.location())) {
+        removedFileADeletes = removed;
+      }
+    }
+
+    assertThat(removedEqDeletes).isNotNull();
+    assertThat(removedEqDeletes.specId()).isEqualTo(FILE_B2_EQ_DELETES.specId());
+    assertThat(removedEqDeletes.recordCount()).isEqualTo(FILE_B2_EQ_DELETES.recordCount());
+    assertThat(removedEqDeletes.fileSizeInBytes()).isEqualTo(FILE_B2_EQ_DELETES.fileSizeInBytes());
+    assertThat(removedEqDeletes.equalityFieldIds()).containsExactly(2);
+
+    assertThat(removedFileADeletes).isNotNull();
+    assertThat(removedFileADeletes.contentOffset()).isEqualTo(fileADeletes.contentOffset());
+    assertThat(removedFileADeletes.contentSizeInBytes())
+        .isEqualTo(fileADeletes.contentSizeInBytes());
+    assertThat(removedFileADeletes.referencedDataFile())
+        .isEqualTo(fileADeletes.referencedDataFile());
+
+    // And the commit built from those stripped files actually took effect.
+    List<String> liveLocations =
+        liveEntries().stream().map(Tuple2::_2).collect(Collectors.toList());
+    assertThat(liveLocations)
+        .doesNotContain(fileADeletes.location(), FILE_B2_EQ_DELETES.location())
+        .contains(FILE_B_EQ_DELETES.location(), FILE_B.location(), FILE_B2.location());
+  }
+
   private List<Tuple2<Long, String>> liveEntries() {
     return spark
         .read()
