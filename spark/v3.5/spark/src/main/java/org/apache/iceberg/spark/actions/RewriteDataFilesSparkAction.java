@@ -177,6 +177,17 @@ public class RewriteDataFilesSparkAction
 
     if (ctx.totalGroupCount() == 0) {
       LOG.info("Nothing found to rewrite in {}", table.name());
+      // AFFIRM: still run dangling-delete removal on this path. `delete-file-threshold` normally
+      // guarantees a non-empty group set, EXCEPT in the exact stuck state this feature exists to
+      // escape: once the only remaining delete files are already dangling, no data file qualifies
+      // for rewrite, so totalGroupCount() == 0 and returning here would leave them in place
+      // forever. Not covered by apache/iceberg#15727, which does not touch this file; the hole is
+      // still present upstream on main.
+      if (removeDanglingDeletes) {
+        return removeDanglingDeletesAndBuild(
+            ImmutableRewriteDataFiles.Result.builder().rewriteResults(ImmutableList.of()));
+      }
+
       return EMPTY_RESULT;
     }
 
@@ -188,11 +199,19 @@ public class RewriteDataFilesSparkAction
             : doExecute(ctx, groupStream, commitManager(startingSnapshotId));
 
     if (removeDanglingDeletes) {
-      RemoveDanglingDeletesSparkAction action =
-          new RemoveDanglingDeletesSparkAction(spark(), table);
-      int removedCount = Iterables.size(action.execute().removedDeleteFiles());
-      resultBuilder.removedDeleteFilesCount(removedCount);
+      return removeDanglingDeletesAndBuild(resultBuilder);
     }
+    return resultBuilder.build();
+  }
+
+  /**
+   * AFFIRM: extracted so the dangling-delete removal can also run on the "nothing to rewrite" early
+   * return path above, not just after a successful data rewrite.
+   */
+  private RewriteDataFiles.Result removeDanglingDeletesAndBuild(Builder resultBuilder) {
+    RemoveDanglingDeletesSparkAction action = new RemoveDanglingDeletesSparkAction(spark(), table);
+    int removedCount = Iterables.size(action.execute().removedDeleteFiles());
+    resultBuilder.removedDeleteFilesCount(removedCount);
     return resultBuilder.build();
   }
 

@@ -202,12 +202,12 @@ class DeleteFileIndex {
     }
 
     DeleteFile dv = dvByPath.get(dataFile.location());
-    if (dv != null) {
-      ValidationException.check(
-          dv.dataSequenceNumber() >= seq,
-          "DV data sequence number (%s) must be greater than or equal to data file sequence number (%s)",
-          dv.dataSequenceNumber(),
-          seq);
+    // AFFIRM: from apache/iceberg#15727. A DV whose data sequence number is below the data file's
+    // simply does not apply, so return null instead of throwing. Required by the scan-based
+    // dangling-delete detection: it plans a full scan, and throwing here would abort that scan on
+    // exactly the stale DVs the cleanup exists to remove.
+    if (dv != null && dv.dataSequenceNumber() < seq) {
+      return null;
     }
     return dv;
   }
