@@ -94,7 +94,8 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   // additionally verifies by content (file path) against a small, bounded window of recent
   // history, so a lost-response race can't silently double-register a file. Bounded to a small
   // constant so cost stays flat regardless of total table/snapshot history size.
-  private static final int RECENT_SNAPSHOT_LOOKBACK = 5;
+  static final String RECENT_SNAPSHOT_LOOKBACK_PROP = "flink.recent-snapshot-lookback";
+  private static final int RECENT_SNAPSHOT_LOOKBACK_DEFAULT = 5;
 
   // AFFIRM: apache/iceberg's REST client maps a 500/502/504 from the catalog on a commit request
   // to CommitStateUnknownException (see ErrorHandlers#commitErrorHandler) -- the request may have
@@ -107,9 +108,15 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   // Rather than rely on that restart happening to be slow enough for the catalog to catch up (it
   // wasn't, in production: see the 17s-apart duplicate on chrono.user_updates_status), poll the
   // catalog directly for a bounded window to find out whether the commit actually landed before
-  // letting the exception propagate into an uncontrolled restart.
-  private static final int COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS = 5;
-  private static final long COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS = 1000L;
+  // letting the exception propagate into an uncontrolled restart. Configurable via table
+  // properties (same pattern as MAX_CONTINUOUS_EMPTY_COMMITS below) so this can be tuned without a
+  // code change, and so tests don't have to sleep through the real default budget.
+  static final String COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS_PROP =
+      "flink.commit-state-unknown-max-verify-attempts";
+  static final String COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS_PROP =
+      "flink.commit-state-unknown-verify-initial-delay-ms";
+  private static final int COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS_DEFAULT = 5;
+  private static final long COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS_DEFAULT = 1000L;
 
   // TableLoader to load iceberg table lazily.
   private final TableLoader tableLoader;
@@ -139,6 +146,9 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   private transient long maxCommittedCheckpointId;
   private transient int continuousEmptyCheckpoints;
   private transient int maxContinuousEmptyCommits;
+  private transient int recentSnapshotLookback;
+  private transient int commitStateUnknownMaxVerifyAttempts;
+  private transient long commitStateUnknownVerifyInitialDelayMs;
   // There're two cases that we restore from flink checkpoints: the first case is restoring from
   // snapshot created by the same flink job; another case is restoring from snapshot created by
   // another different job. For the second case, we need to maintain the old flink job's id in flink
@@ -186,6 +196,19 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         PropertyUtil.propertyAsInt(table.properties(), MAX_CONTINUOUS_EMPTY_COMMITS, 10);
     Preconditions.checkArgument(
         maxContinuousEmptyCommits > 0, MAX_CONTINUOUS_EMPTY_COMMITS + " must be positive");
+    recentSnapshotLookback =
+        PropertyUtil.propertyAsInt(
+            table.properties(), RECENT_SNAPSHOT_LOOKBACK_PROP, RECENT_SNAPSHOT_LOOKBACK_DEFAULT);
+    commitStateUnknownMaxVerifyAttempts =
+        PropertyUtil.propertyAsInt(
+            table.properties(),
+            COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS_PROP,
+            COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS_DEFAULT);
+    commitStateUnknownVerifyInitialDelayMs =
+        PropertyUtil.propertyAsLong(
+            table.properties(),
+            COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS_PROP,
+            COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS_DEFAULT);
 
     int subTaskId = getRuntimeContext().getIndexOfThisSubtask();
     int attemptId = getRuntimeContext().getAttemptNumber();
@@ -318,13 +341,15 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
   /**
    * AFFIRM: defense-in-depth against apache/iceberg#10765. Drops any data/delete file from {@code
-   * pendingResults} whose exact path already appears as an added file in one of the last {@link
-   * #RECENT_SNAPSHOT_LOOKBACK} ancestor snapshots committed by this same flinkJobId/operatorId.
-   * This does not replace {@link #getMaxCommittedCheckpointId}; it's an additional, content-based
-   * check for the narrow window where that metadata-only check can be fooled by a commit whose
-   * response was lost/ambiguous to the client but which actually succeeded on the catalog.
+   * pendingResults} whose exact path already appears as an added file in one of the last {@code
+   * recentSnapshotLookback} ancestor snapshots committed by this same flinkJobId/operatorId. This
+   * does not replace {@link #getMaxCommittedCheckpointId}; it's an additional, content-based check
+   * for the narrow window where that metadata-only check can be fooled by a commit whose response
+   * was lost/ambiguous to the client but which actually succeeded on the catalog.
    */
-  private NavigableMap<Long, WriteResult> dropAlreadyCommittedFiles(
+  @VisibleForTesting
+  @SuppressWarnings("CollectionUndefinedEquality") // CharSequenceSet defines path equality itself
+  NavigableMap<Long, WriteResult> dropAlreadyCommittedFiles(
       NavigableMap<Long, WriteResult> pendingResults, String newFlinkJobId, String operatorId) {
     CharSequenceSet recentlyCommittedPaths =
         collectRecentlyCommittedFilePaths(newFlinkJobId, operatorId);
@@ -383,8 +408,8 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
   /**
    * Walks back from the current snapshot on {@link #branch}, collecting the paths of data/delete
-   * files added by snapshots committed by this exact flinkJobId/operatorId, stopping after {@link
-   * #RECENT_SNAPSHOT_LOOKBACK} ancestor snapshots (regardless of whether they match) to keep this
+   * files added by snapshots committed by this exact flinkJobId/operatorId, stopping after {@code
+   * recentSnapshotLookback} ancestor snapshots (regardless of whether they match) to keep this
    * bounded and cheap. Refreshes the table first so this observes the freshest metadata available.
    */
   private CharSequenceSet collectRecentlyCommittedFilePaths(String flinkJobId, String operatorId) {
@@ -393,7 +418,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     CharSequenceSet paths = CharSequenceSet.empty();
     Snapshot snapshot = table.snapshot(branch);
     int inspected = 0;
-    while (snapshot != null && inspected < RECENT_SNAPSHOT_LOOKBACK) {
+    while (snapshot != null && inspected < recentSnapshotLookback) {
       Map<String, String> summary = snapshot.summary();
       if (flinkJobId.equals(summary.get(FLINK_JOB_ID))
           && (summary.get(OPERATOR_ID) == null || operatorId.equals(summary.get(OPERATOR_ID)))) {
@@ -548,8 +573,8 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
       // CommitStateUnknownException -- see the catch block below.
     } catch (CommitStateUnknownException e) {
       // AFFIRM: see apache/iceberg#10765 and the class-level comment on
-      // COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS. Don't let Flink's restart-strategy be the thing
-      // that decides whether this ambiguous commit gets blindly retried; check for ourselves.
+      // COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS_PROP. Don't let Flink's restart-strategy be the
+      // thing that decides whether this ambiguous commit gets blindly retried; check ourselves.
       if (verifyCommitEventuallySucceeded(newFlinkJobId, operatorId, checkpointId, description)) {
         LOG.warn(
             "Commit {} for checkpoint {} to table {} branch {} returned an ambiguous response "
@@ -575,7 +600,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
           checkpointId,
           table.name(),
           branch,
-          COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS,
+          commitStateUnknownMaxVerifyAttempts,
           e);
       throw e;
     }
@@ -591,19 +616,20 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   }
 
   /**
-   * AFFIRM: polls, with exponential backoff, for up to {@link
-   * #COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS} attempts to determine whether a commit that just
-   * threw {@link CommitStateUnknownException} actually landed on the catalog, by refreshing the
-   * table and checking whether {@code checkpointId} is now covered by {@link
-   * #getMaxCommittedCheckpointId}. Deliberately blocks the calling thread (inside
-   * notifyCheckpointComplete): a bounded wait here is preferable to unconditionally failing the
-   * task and paying for a full restart-and-restore cycle only to hit the same ambiguity check
-   * again. Returns false (not verified) if the budget is exhausted or the wait is interrupted.
+   * AFFIRM: polls, with exponential backoff, for up to {@code commitStateUnknownMaxVerifyAttempts}
+   * attempts to determine whether a commit that just threw {@link CommitStateUnknownException}
+   * actually landed on the catalog, by refreshing the table and checking whether {@code
+   * checkpointId} is now covered by {@link #getMaxCommittedCheckpointId}. Deliberately blocks the
+   * calling thread (inside notifyCheckpointComplete): a bounded wait here is preferable to
+   * unconditionally failing the task and paying for a full restart-and-restore cycle only to hit
+   * the same ambiguity check again. Returns false (not verified) if the budget is exhausted or the
+   * wait is interrupted.
    */
-  private boolean verifyCommitEventuallySucceeded(
+  @VisibleForTesting
+  boolean verifyCommitEventuallySucceeded(
       String flinkJobId, String operatorId, long checkpointId, String description) {
-    long delayMs = COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS;
-    for (int attempt = 1; attempt <= COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS; attempt++) {
+    long delayMs = commitStateUnknownVerifyInitialDelayMs;
+    for (int attempt = 1; attempt <= commitStateUnknownMaxVerifyAttempts; attempt++) {
       try {
         Thread.sleep(delayMs);
       } catch (InterruptedException interruptedException) {
@@ -622,7 +648,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
           table.name(),
           branch,
           attempt,
-          COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS,
+          commitStateUnknownMaxVerifyAttempts,
           observedCheckpointId,
           flinkJobId,
           operatorId);
