@@ -119,6 +119,30 @@ public interface RewriteDataFiles
   boolean REMOVE_DANGLING_DELETES_DEFAULT = false;
 
   /**
+   * Validate, before planning any rewrite, that no live data file path is registered at more than
+   * one data sequence number.
+   *
+   * <p>A single physical data file registered twice is not something a healthy writer produces. It
+   * arises when a commit is retried after its outcome became unknown (for example {@link
+   * org.apache.iceberg.exceptions.CommitStateUnknownException}) and the retry re-registers a
+   * WriteResult that had in fact already been applied.
+   *
+   * <p>Such a table cannot be safely compacted. File identity in the rewrite path is keyed on
+   * location alone, so the two registrations are indistinguishable: the data side removes one of
+   * them while the delete side removes both of the corresponding delete-file registrations. The
+   * surviving data registration is then left with no delete file covering it and previously
+   * suppressed rows become visible.
+   *
+   * <p>When enabled and a duplicate registration is found, the action fails before making any
+   * commit. Set to false only to compact such a table deliberately, having accepted that risk.
+   *
+   * <p>Defaults to true.
+   */
+  String VALIDATE_DUPLICATE_FILE_REGISTRATIONS = "validate-duplicate-file-registrations";
+
+  boolean VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT = true;
+
+  /**
    * Forces the rewrite job order based on the value.
    *
    * <p>

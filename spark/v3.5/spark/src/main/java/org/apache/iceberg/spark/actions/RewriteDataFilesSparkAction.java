@@ -34,6 +34,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.RewriteJobOrder;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
@@ -67,6 +68,7 @@ import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.StructLikeMap;
 import org.apache.iceberg.util.Tasks;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.internal.SQLConf;
 import org.slf4j.Logger;
@@ -87,7 +89,10 @@ public class RewriteDataFilesSparkAction
           USE_STARTING_SEQUENCE_NUMBER,
           REWRITE_JOB_ORDER,
           OUTPUT_SPEC_ID,
-          REMOVE_DANGLING_DELETES);
+          REMOVE_DANGLING_DELETES,
+          VALIDATE_DUPLICATE_FILE_REGISTRATIONS);
+
+  private static final int DUPLICATE_REGISTRATION_REPORT_LIMIT = 10;
 
   private static final RewriteDataFilesSparkAction.Result EMPTY_RESULT =
       ImmutableRewriteDataFiles.Result.builder().rewriteResults(ImmutableList.of()).build();
@@ -100,6 +105,7 @@ public class RewriteDataFilesSparkAction
   private int maxFailedCommits;
   private boolean partialProgressEnabled;
   private boolean removeDanglingDeletes;
+  private boolean validateDuplicateFileRegistrations;
   private boolean useStartingSequenceNumber;
   private RewriteJobOrder rewriteJobOrder;
   private FileRewriter<FileScanTask, DataFile> rewriter = null;
@@ -171,6 +177,10 @@ public class RewriteDataFilesSparkAction
 
     validateAndInitOptions();
 
+    if (validateDuplicateFileRegistrations) {
+      validateNoDuplicateFileRegistrations();
+    }
+
     StructLikeMap<List<List<FileScanTask>>> fileGroupsByPartition =
         planFileGroups(startingSnapshotId);
     RewriteExecutionContext ctx = new RewriteExecutionContext(fileGroupsByPartition);
@@ -213,6 +223,59 @@ public class RewriteDataFilesSparkAction
     int removedCount = Iterables.size(action.execute().removedDeleteFiles());
     resultBuilder.removedDeleteFilesCount(removedCount);
     return resultBuilder.build();
+  }
+
+  /**
+   * AFFIRM: fails if any live data file path is registered at more than one data sequence number.
+   *
+   * <p>Rewriting such a table silently corrupts it. {@code DataFileSet} and {@code DeleteFileSet}
+   * both key file identity on location alone, and a file's data sequence number lives on the
+   * manifest entry rather than on the {@code ContentFile}, so the two registrations cannot be told
+   * apart. The data side removes one of the two, because the collapsed {@code DataFile} carries a
+   * single {@code manifestLocation()} and the other manifest is never opened. The delete side
+   * removes both, because {@code SparkContentFile} does not override {@code manifestLocation()} and
+   * every manifest is therefore filtered. The surviving data registration is left with no delete
+   * file covering it, and rows that were correctly suppressed become visible.
+   *
+   * <p>Costs one scan of the entries metadata table, projecting two columns.
+   */
+  @VisibleForTesting
+  void validateNoDuplicateFileRegistrations() {
+    List<Row> duplicates =
+        loadMetadataTable(table, MetadataTableType.ENTRIES)
+            // live data file entries only: content 0 is DATA, status 2 is DELETED
+            .filter("data_file.content == 0 AND status < 2")
+            .selectExpr("data_file.file_path as file_path", "sequence_number")
+            .distinct()
+            .groupBy("file_path")
+            .count()
+            .filter("count > 1")
+            .limit(DUPLICATE_REGISTRATION_REPORT_LIMIT + 1)
+            .collectAsList();
+
+    if (duplicates.isEmpty()) {
+      return;
+    }
+
+    boolean truncated = duplicates.size() > DUPLICATE_REGISTRATION_REPORT_LIMIT;
+    String sample =
+        duplicates.stream()
+            .limit(DUPLICATE_REGISTRATION_REPORT_LIMIT)
+            .map(row -> String.format("%s (%d sequence numbers)", row.getString(0), row.getLong(1)))
+            .collect(Collectors.joining(", "));
+
+    throw new ValidationException(
+        "Cannot rewrite %s: %s%d data file path(s) are registered at more than one data sequence "
+            + "number. Compaction cannot handle that safely and would turn it into duplicate rows. "
+            + "This usually follows a commit retried after its outcome became unknown. "
+            + "Affected: %s%s. Resolve the duplicate registrations first, or set %s=false to "
+            + "proceed anyway and accept the risk.",
+        table.name(),
+        truncated ? "at least " : "",
+        Math.min(duplicates.size(), DUPLICATE_REGISTRATION_REPORT_LIMIT),
+        sample,
+        truncated ? ", ..." : "",
+        VALIDATE_DUPLICATE_FILE_REGISTRATIONS);
   }
 
   StructLikeMap<List<List<FileScanTask>>> planFileGroups(long startingSnapshotId) {
@@ -492,6 +555,12 @@ public class RewriteDataFilesSparkAction
     removeDanglingDeletes =
         PropertyUtil.propertyAsBoolean(
             options(), REMOVE_DANGLING_DELETES, REMOVE_DANGLING_DELETES_DEFAULT);
+
+    validateDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
 
     rewriteJobOrder =
         RewriteJobOrder.fromName(

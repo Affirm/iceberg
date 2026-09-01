@@ -26,6 +26,7 @@ import static org.apache.spark.sql.functions.date_add;
 import static org.apache.spark.sql.functions.expr;
 import static org.apache.spark.sql.functions.min;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -92,6 +93,7 @@ import org.apache.iceberg.encryption.EncryptionKeyMetadata;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
@@ -2246,6 +2248,49 @@ public class TestRewriteDataFilesAction extends TestBase {
    * @param files number of files to create
    * @return the created table
    */
+  @TestTemplate
+  public void testRejectsDuplicateDataFileRegistrations() {
+    Table table = createTablePartitioned(4, 2);
+    shouldHaveFiles(table, 8);
+
+    // Re-register an already-live data file at a second data sequence number. This is what a
+    // commit retried after CommitStateUnknownException produces: one physical file, listed twice.
+    DataFile existing =
+        Iterables.getFirst(table.currentSnapshot().addedDataFiles(table.io()), null);
+    assertThat(existing).isNotNull();
+    table.newAppend().appendFile(existing).commit();
+
+    assertThatThrownBy(() -> basicRewrite(table).execute())
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("registered at more than one data sequence number")
+        .hasMessageContaining(existing.location());
+  }
+
+  @TestTemplate
+  public void testDuplicateDataFileRegistrationCheckCanBeDisabled() {
+    Table table = createTablePartitioned(4, 2);
+    DataFile existing =
+        Iterables.getFirst(table.currentSnapshot().addedDataFiles(table.io()), null);
+    assertThat(existing).isNotNull();
+    table.newAppend().appendFile(existing).commit();
+
+    // Explicit opt-out must still run, so an operator can compact deliberately.
+    assertThatNoException()
+        .isThrownBy(
+            () ->
+                basicRewrite(table)
+                    .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
+                    .execute());
+  }
+
+  @TestTemplate
+  public void testAcceptsTableWithoutDuplicateRegistrations() {
+    Table table = createTablePartitioned(4, 2);
+    shouldHaveFiles(table, 8);
+
+    assertThatNoException().isThrownBy(() -> basicRewrite(table).execute());
+  }
+
   protected Table createTable(int files) {
     Table table = createTable();
     writeRecords(files, SCALE);
