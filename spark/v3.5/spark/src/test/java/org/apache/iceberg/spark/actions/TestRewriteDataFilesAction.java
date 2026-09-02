@@ -2115,6 +2115,16 @@ public class TestRewriteDataFilesAction extends TestBase {
     return actual;
   }
 
+  /** AFFIRM: how many distinct live data sequence numbers a file path is currently registered at. */
+  protected long distinctLiveSequenceNumbersForPath(Table table, String path) {
+    return SparkTableUtil.loadMetadataTable(spark, table, MetadataTableType.ENTRIES)
+        .filter("status < 2")
+        .filter("data_file.file_path = '" + path + "'")
+        .select("sequence_number")
+        .distinct()
+        .count();
+  }
+
   protected void shouldHaveSnapshots(Table table, int expectedSnapshots) {
     table.refresh();
     int actualSnapshots = Iterables.size(table.snapshots());
@@ -2260,10 +2270,71 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertThat(existing).isNotNull();
     table.newAppend().appendFile(existing).commit();
 
-    assertThatThrownBy(() -> basicRewrite(table).execute())
+    // Repair is on by default now, so this exercises the explicit opt-out back to the original
+    // fail-fast behavior.
+    assertThatThrownBy(
+            () ->
+                basicRewrite(table)
+                    .option(RewriteDataFiles.RESOLVE_DUPLICATE_FILE_REGISTRATIONS, "false")
+                    .execute())
         .isInstanceOf(ValidationException.class)
         .hasMessageContaining("registered at more than one data sequence number")
         .hasMessageContaining(existing.location());
+  }
+
+  @TestTemplate
+  public void testRepairsDuplicateDataFileRegistrations() {
+    Table table = createTablePartitioned(4, 2);
+    shouldHaveFiles(table, 8);
+
+    DataFile existing =
+        Iterables.getFirst(table.currentSnapshot().addedDataFiles(table.io()), null);
+    assertThat(existing).isNotNull();
+    table.newAppend().appendFile(existing).commit();
+    assertThat(distinctLiveSequenceNumbersForPath(table, existing.location().toString()))
+        .as("Duplicate registration must exist before repair")
+        .isEqualTo(2);
+
+    // Default behavior: repair the duplicate before planFileGroups() runs, instead of failing.
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table);
+    rewrite.validateAndInitOptions();
+    assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
+
+    assertThat(distinctLiveSequenceNumbersForPath(table, existing.location().toString()))
+        .as("Repair must keep exactly one registration -- the original, lowest sequence number")
+        .isEqualTo(1);
+    shouldHaveMinSequenceNumberInPartition(
+        table, "data_file.file_path = '" + existing.location() + "'", 1);
+  }
+
+  @TestTemplate
+  public void testRepairsDuplicateDeleteFileRegistrations() {
+    // Restricted to v2 position deletes: v3 deletion vectors have different per-data-file
+    // uniqueness semantics not exercised by this scenario.
+    assumeThat(formatVersion).isEqualTo(2);
+
+    Table table = createTablePartitioned(4, 2);
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table, null);
+    DeleteFile deleteFile = writePosDeletesToFile(table, dataFiles.get(0), 1).get(0);
+    table.newRowDelta().addDeletes(deleteFile).commit();
+    assertThat(distinctLiveSequenceNumbersForPath(table, deleteFile.location().toString()))
+        .as("Sanity check: exactly one registration before duplicating it")
+        .isEqualTo(1);
+
+    // Re-register the already-live delete file at a second data sequence number -- the delete
+    // side's version of the same CommitStateUnknownException retry scenario.
+    table.newRowDelta().addDeletes(deleteFile).commit();
+    assertThat(distinctLiveSequenceNumbersForPath(table, deleteFile.location().toString()))
+        .as("Duplicate registration must exist before repair")
+        .isEqualTo(2);
+
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table);
+    rewrite.validateAndInitOptions();
+    assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
+
+    assertThat(distinctLiveSequenceNumbersForPath(table, deleteFile.location().toString()))
+        .as("Repair must keep exactly one registration -- the original, lowest sequence number")
+        .isEqualTo(1);
   }
 
   @TestTemplate
