@@ -346,9 +346,10 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
    * AFFIRM: defense-in-depth against apache/iceberg#10765. Drops any data/delete file from {@code
    * pendingResults} whose exact path already appears as an added file in one of the last {@code
    * recentSnapshotLookback} ancestor snapshots committed by this same flinkJobId/operatorId. This
-   * does not replace {@link SinkUtil#getMaxCommittedCheckpointId}; it's an additional, content-based
-   * check for the narrow window where that metadata-only check can be fooled by a commit whose
-   * response was lost/ambiguous to the client but which actually succeeded on the catalog.
+   * does not replace {@link SinkUtil#getMaxCommittedCheckpointId}; it's an additional,
+   * content-based check for the narrow window where that metadata-only check can be fooled by a
+   * commit whose response was lost/ambiguous to the client but which actually succeeded on the
+   * catalog.
    */
   @VisibleForTesting
   @SuppressWarnings("CollectionUndefinedEquality") // CharSequenceSet defines path equality itself
@@ -376,7 +377,12 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
       for (DeleteFile file : result.deleteFiles()) {
         if (logAndSkipIfAlreadyCommitted(
-            "delete", file.path(), recentlyCommittedPaths, newFlinkJobId, operatorId, checkpointId)) {
+            "delete",
+            file.path(),
+            recentlyCommittedPaths,
+            newFlinkJobId,
+            operatorId,
+            checkpointId)) {
           builder.addDeleteFiles(file);
         }
       }
@@ -434,8 +440,8 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
    * Refreshes the table first so this observes the freshest metadata available.
    *
    * <p>AFFIRM: the budget is intentionally scoped to matching snapshots only. Non-Flink maintenance
-   * snapshots (compaction, dangling-delete removal, etc.) interleaved on the branch don't carry this
-   * flinkJobId/operatorId and must not silently consume the lookback window meant for this
+   * snapshots (compaction, dangling-delete removal, etc.) interleaved on the branch don't carry
+   * this flinkJobId/operatorId and must not silently consume the lookback window meant for this
    * committer's own recent history -- otherwise a run of 5+ such snapshots between an ambiguous
    * commit and its retry would defeat this check for the exact #10765 scenario it exists to catch.
    */
@@ -446,7 +452,9 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     Snapshot snapshot = table.snapshot(branch);
     int matched = 0;
     int visited = 0;
-    while (snapshot != null && matched < recentSnapshotLookback && visited < RECENT_SNAPSHOT_WALK_LIMIT) {
+    while (snapshot != null
+        && matched < recentSnapshotLookback
+        && visited < RECENT_SNAPSHOT_WALK_LIMIT) {
       Map<String, String> summary = snapshot.summary();
       if (flinkJobId.equals(summary.get(FLINK_JOB_ID))
           && (summary.get(OPERATOR_ID) == null || operatorId.equals(summary.get(OPERATOR_ID)))) {

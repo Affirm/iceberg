@@ -360,10 +360,12 @@ public class TestIcebergFilesCommitter extends TestBase {
       RowData row2 = SimpleDataUtil.createInsert(2, "bbb");
       DataFile dataFile2 = writeDataFile("data-2", ImmutableList.of(row2));
       RowData delete1 = SimpleDataUtil.createDelete(1, "aaa");
-      DeleteFile deleteFile1 = writeEqDeleteFile(writerFactory, "delete-1", ImmutableList.of(delete1));
+      DeleteFile deleteFile1 =
+          writeEqDeleteFile(writerFactory, "delete-1", ImmutableList.of(delete1));
       harness.processElement(
           new FlinkWriteResult(
-              3L, WriteResult.builder().addDataFiles(dataFile2).addDeleteFiles(deleteFile1).build()),
+              3L,
+              WriteResult.builder().addDataFiles(dataFile2).addDeleteFiles(deleteFile1).build()),
           ++timestamp);
       harness.snapshot(3L, ++timestamp);
 
