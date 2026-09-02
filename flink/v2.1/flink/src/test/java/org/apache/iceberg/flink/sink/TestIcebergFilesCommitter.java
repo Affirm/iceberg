@@ -180,6 +180,252 @@ public class TestIcebergFilesCommitter extends TestBase {
   }
 
   @TestTemplate
+  public void testDropAlreadyCommittedFilesDropsDuplicatePath() throws Exception {
+    // AFFIRM: regression test for apache/iceberg#10765. Simulates the production race directly:
+    // getMaxCommittedCheckpointId() is evaluated against stale catalog state and a checkpoint
+    // whose file was already committed gets bundled into a later commit attempt anyway.
+    // dropAlreadyCommittedFiles should catch it by path, independent of that metadata check.
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile("data-1", ImmutableList.of(row1));
+
+      long checkpointId = 1;
+      harness.processElement(of(checkpointId, dataFile1), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+
+      SimpleDataUtil.assertTableRows(table, ImmutableList.of(row1), branch);
+      assertSnapshotSize(1);
+      assertMaxCommittedCheckpointId(jobId, operatorId, checkpointId);
+
+      // Build a pendingResults map, as if for a subsequent commit attempt, that (incorrectly)
+      // still includes dataFile1 -- the exact shape of the production duplicate, where the same
+      // physical file got bundled into a commit whose checkpoint the dedup check believed was
+      // not yet committed -- alongside a genuinely new file that must NOT be dropped.
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile2 = writeDataFile("data-2", ImmutableList.of(row2));
+
+      NavigableMap<Long, WriteResult> pendingResults = Maps.newTreeMap();
+      pendingResults.put(2L, WriteResult.builder().addDataFiles(dataFile1, dataFile2).build());
+
+      IcebergFilesCommitter committer = (IcebergFilesCommitter) harness.getOperator();
+      NavigableMap<Long, WriteResult> deduped =
+          committer.dropAlreadyCommittedFiles(
+              pendingResults, jobId.toString(), operatorId.toHexString());
+
+      List<DataFile> remaining = Lists.newArrayList(deduped.get(2L).dataFiles());
+      assertThat(remaining).hasSize(1);
+      assertThat(remaining.get(0).location()).isEqualTo(dataFile2.location());
+    }
+  }
+
+  @TestTemplate
+  public void testDropAlreadyCommittedFilesKeepsUnrelatedFiles() throws Exception {
+    // Sanity check for the same method: when nothing in pendingResults was already committed,
+    // dropAlreadyCommittedFiles must be a no-op (return the input unchanged in content).
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile("data-1", ImmutableList.of(row1));
+      long checkpointId = 1;
+      harness.processElement(of(checkpointId, dataFile1), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile2 = writeDataFile("data-2", ImmutableList.of(row2));
+      NavigableMap<Long, WriteResult> pendingResults = Maps.newTreeMap();
+      pendingResults.put(2L, WriteResult.builder().addDataFiles(dataFile2).build());
+
+      IcebergFilesCommitter committer = (IcebergFilesCommitter) harness.getOperator();
+      NavigableMap<Long, WriteResult> deduped =
+          committer.dropAlreadyCommittedFiles(
+              pendingResults, jobId.toString(), operatorId.toHexString());
+
+      List<DataFile> remaining = Lists.newArrayList(deduped.get(2L).dataFiles());
+      assertThat(remaining).hasSize(1);
+      assertThat(remaining.get(0).location()).isEqualTo(dataFile2.location());
+    }
+  }
+
+  @TestTemplate
+  public void testDropAlreadyCommittedFilesSkipsNonMatchingSnapshotsInLookbackBudget()
+      throws Exception {
+    // AFFIRM: regression test for the lookback-counting bug flagged in review of #5: the walk in
+    // collectRecentlyCommittedFilePaths must only spend its (small, configurable) lookback budget
+    // on snapshots that actually belong to this flinkJobId/operatorId. Non-Flink maintenance
+    // snapshots (compaction, dangling-delete removal, etc.) interleaved on the branch must NOT
+    // consume that budget -- otherwise a handful of such snapshots between an ambiguous commit and
+    // its retry would defeat this check for the exact scenario it exists to catch.
+    //
+    // Set the lookback to the smallest possible value (1) and interleave several unrelated
+    // (non-Flink) snapshots after the one real Flink commit. If unrelated snapshots counted
+    // against the budget, the walk would never reach the one real match and dataFile1 would NOT be
+    // dropped as a duplicate.
+    table.updateProperties().set(IcebergFilesCommitter.RECENT_SNAPSHOT_LOOKBACK_PROP, "1").commit();
+
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile("data-1", ImmutableList.of(row1));
+      long checkpointId = 1;
+      harness.processElement(of(checkpointId, dataFile1), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertSnapshotSize(1);
+
+      // Six unrelated, non-Flink snapshots landing after the real Flink commit -- more than the
+      // lookback budget of 1, so this only passes if unrelated snapshots are excluded from the
+      // count entirely rather than merely being "usually enough budget."
+      for (int i = 0; i < 6; i++) {
+        RowData fillerRow = SimpleDataUtil.createRowData(100 + i, "filler-" + i);
+        DataFile fillerFile = writeDataFile("unrelated-" + i, ImmutableList.of(fillerRow));
+        table.newFastAppend().appendFile(fillerFile).commit();
+      }
+      assertSnapshotSize(7);
+
+      NavigableMap<Long, WriteResult> pendingResults = Maps.newTreeMap();
+      pendingResults.put(2L, WriteResult.builder().addDataFiles(dataFile1).build());
+
+      IcebergFilesCommitter committer = (IcebergFilesCommitter) harness.getOperator();
+      NavigableMap<Long, WriteResult> deduped =
+          committer.dropAlreadyCommittedFiles(
+              pendingResults, jobId.toString(), operatorId.toHexString());
+
+      assertThat(Lists.newArrayList(deduped.get(2L).dataFiles())).isEmpty();
+    }
+  }
+
+  @TestTemplate
+  public void testCommitUpToCheckpointSkipsFullyDedupedCheckpointEntry() throws Exception {
+    // AFFIRM: regression test for the unguarded-empty-commit bug flagged in review of #5. Drives
+    // the real commitUpToCheckpoint/commitDeltaTxn wiring (not dropAlreadyCommittedFiles directly)
+    // with TWO pending checkpoint entries batched into one commit: one that's a full duplicate
+    // (fully deduped to empty) and one with genuinely new files including a delete, which forces
+    // the per-checkpoint-entry rowDelta path in commitDeltaTxn. Before the fix, the fully-deduped
+    // entry still got its own pointless empty RowDelta#commit() call; assert here that it doesn't
+    // produce an extra snapshot.
+    assumeThat(formatVersion)
+        .as("Only support equality-delete in format v2 or later.")
+        .isGreaterThan(1);
+
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    FileWriterFactory<RowData> writerFactory = createWriterFactory();
+
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row1 = SimpleDataUtil.createInsert(1, "aaa");
+      DataFile dataFile1 = writeDataFile("data-1", ImmutableList.of(row1));
+      harness.processElement(of(1L, dataFile1), ++timestamp);
+      harness.snapshot(1L, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(1L);
+
+      SimpleDataUtil.assertTableRows(table, ImmutableList.of(row1), branch);
+      assertSnapshotSize(1);
+
+      // Checkpoint 2: a retry duplicate of dataFile1 -- left pending, not yet committed.
+      harness.processElement(of(2L, dataFile1), ++timestamp);
+      harness.snapshot(2L, ++timestamp);
+
+      // Checkpoint 3: a genuinely new file plus a delete for row1 -- also left pending, batched
+      // together with checkpoint 2 into the single commit triggered below.
+      RowData row2 = SimpleDataUtil.createInsert(2, "bbb");
+      DataFile dataFile2 = writeDataFile("data-2", ImmutableList.of(row2));
+      RowData delete1 = SimpleDataUtil.createDelete(1, "aaa");
+      DeleteFile deleteFile1 = writeEqDeleteFile(writerFactory, "delete-1", ImmutableList.of(delete1));
+      harness.processElement(
+          new FlinkWriteResult(
+              3L, WriteResult.builder().addDataFiles(dataFile2).addDeleteFiles(deleteFile1).build()),
+          ++timestamp);
+      harness.snapshot(3L, ++timestamp);
+
+      // A single notifyCheckpointComplete drives commitUpToCheckpoint over both pending entries
+      // (2 and 3) in one call, so dropAlreadyCommittedFiles sees both and checkpoint 2's entry
+      // comes out fully empty while checkpoint 3's does not.
+      harness.notifyOfCompletedCheckpoint(3L);
+
+      // Exactly one new snapshot for checkpoint 3's real commit -- none for checkpoint 2's
+      // fully-deduped, empty entry.
+      assertSnapshotSize(2);
+      SimpleDataUtil.assertTableRows(table, ImmutableList.of(row2), branch);
+    }
+  }
+
+  @TestTemplate
+  public void testVerifyCommitEventuallySucceeded() throws Exception {
+    // AFFIRM: regression test for the CommitStateUnknownException handling in commitOperation.
+    // Configure a fast, test-scale retry budget rather than the real default (5 attempts,
+    // starting at 1s, exponential backoff) so this doesn't take ~30s to run.
+    table
+        .updateProperties()
+        .set(IcebergFilesCommitter.COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS_PROP, "2")
+        .set(IcebergFilesCommitter.COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS_PROP, "10")
+        .commit();
+
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile = writeDataFile("data-1", ImmutableList.of(row));
+      long checkpointId = 1;
+      harness.processElement(of(checkpointId, dataFile), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+
+      assertMaxCommittedCheckpointId(jobId, operatorId, checkpointId);
+
+      IcebergFilesCommitter committer = (IcebergFilesCommitter) harness.getOperator();
+
+      // checkpointId really was committed -- must verify true.
+      assertThat(
+              committer.verifyCommitEventuallySucceeded(
+                  jobId.toString(), operatorId.toHexString(), checkpointId, "test"))
+          .isTrue();
+
+      // A checkpoint id that was never committed must exhaust the retry budget and report false,
+      // so commitOperation knows it's not safe to treat this as a no-op and must rethrow.
+      assertThat(
+              committer.verifyCommitEventuallySucceeded(
+                  jobId.toString(), operatorId.toHexString(), 999L, "test"))
+          .isFalse();
+    }
+  }
+
+  @TestTemplate
   public void testCommitTxn() throws Exception {
     // Test with 3 continues checkpoints:
     //   1. snapshotState for checkpoint#1

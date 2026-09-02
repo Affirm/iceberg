@@ -368,37 +368,15 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
           WriteResult.builder().addReferencedDataFiles(result.referencedDataFiles());
 
       for (DataFile file : result.dataFiles()) {
-        if (recentlyCommittedPaths.contains(file.path())) {
-          LOG.warn(
-              "Dropping data file already present in a recent snapshot for table {} branch {} "
-                  + "flinkJobId {} operatorId {} checkpoint {}: {}. This indicates a prior commit "
-                  + "for this file already succeeded even though this committer didn't observe "
-                  + "that success (see apache/iceberg#10765).",
-              table.name(),
-              branch,
-              newFlinkJobId,
-              operatorId,
-              checkpointId,
-              file.path());
-        } else {
+        if (logAndSkipIfAlreadyCommitted(
+            "data", file.path(), recentlyCommittedPaths, newFlinkJobId, operatorId, checkpointId)) {
           builder.addDataFiles(file);
         }
       }
 
       for (DeleteFile file : result.deleteFiles()) {
-        if (recentlyCommittedPaths.contains(file.path())) {
-          LOG.warn(
-              "Dropping delete file already present in a recent snapshot for table {} branch {} "
-                  + "flinkJobId {} operatorId {} checkpoint {}: {}. This indicates a prior commit "
-                  + "for this file already succeeded even though this committer didn't observe "
-                  + "that success (see apache/iceberg#10765).",
-              table.name(),
-              branch,
-              newFlinkJobId,
-              operatorId,
-              checkpointId,
-              file.path());
-        } else {
+        if (logAndSkipIfAlreadyCommitted(
+            "delete", file.path(), recentlyCommittedPaths, newFlinkJobId, operatorId, checkpointId)) {
           builder.addDeleteFiles(file);
         }
       }
@@ -410,18 +388,65 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   }
 
   /**
+   * Returns {@code true} if {@code path} should be kept (i.e. it's NOT already committed), {@code
+   * false} if it should be dropped -- logging the drop either way. Shared by the data-file and
+   * delete-file loops in {@link #dropAlreadyCommittedFiles} so the two stay in sync.
+   */
+  @SuppressWarnings("CollectionUndefinedEquality") // CharSequenceSet defines path equality itself
+  private boolean logAndSkipIfAlreadyCommitted(
+      String fileKind,
+      CharSequence path,
+      CharSequenceSet recentlyCommittedPaths,
+      String newFlinkJobId,
+      String operatorId,
+      long checkpointId) {
+    if (!recentlyCommittedPaths.contains(path)) {
+      return true;
+    }
+
+    LOG.warn(
+        "Dropping {} file already present in a recent snapshot for table {} branch {} "
+            + "flinkJobId {} operatorId {} checkpoint {}: {}. This indicates a prior commit "
+            + "for this file already succeeded even though this committer didn't observe "
+            + "that success (see apache/iceberg#10765).",
+        fileKind,
+        table.name(),
+        branch,
+        newFlinkJobId,
+        operatorId,
+        checkpointId,
+        path);
+    return false;
+  }
+
+  // AFFIRM: hard ceiling on total ancestor snapshots walked in collectRecentlyCommittedFilePaths,
+  // independent of recentSnapshotLookback (which now only counts *matching* snapshots -- see that
+  // method's comment). Purely a runaway-cost guard for the pathological case of a huge run of
+  // non-Flink-commit snapshots (e.g. a table under heavy external maintenance) with no matching
+  // snapshot anywhere nearby; not expected to bind in normal operation.
+  private static final int RECENT_SNAPSHOT_WALK_LIMIT = 200;
+
+  /**
    * Walks back from the current snapshot on {@link #branch}, collecting the paths of data/delete
-   * files added by snapshots committed by this exact flinkJobId/operatorId, stopping after {@code
-   * recentSnapshotLookback} ancestor snapshots (regardless of whether they match) to keep this
-   * bounded and cheap. Refreshes the table first so this observes the freshest metadata available.
+   * files added by snapshots committed by this exact flinkJobId/operatorId, stopping once {@code
+   * recentSnapshotLookback} *matching* ancestor snapshots have been found (or {@link
+   * #RECENT_SNAPSHOT_WALK_LIMIT} total ancestors have been visited) to keep this bounded and cheap.
+   * Refreshes the table first so this observes the freshest metadata available.
+   *
+   * <p>AFFIRM: the budget is intentionally scoped to matching snapshots only. Non-Flink maintenance
+   * snapshots (compaction, dangling-delete removal, etc.) interleaved on the branch don't carry this
+   * flinkJobId/operatorId and must not silently consume the lookback window meant for this
+   * committer's own recent history -- otherwise a run of 5+ such snapshots between an ambiguous
+   * commit and its retry would defeat this check for the exact #10765 scenario it exists to catch.
    */
   private CharSequenceSet collectRecentlyCommittedFilePaths(String flinkJobId, String operatorId) {
     table.refresh();
 
     CharSequenceSet paths = CharSequenceSet.empty();
     Snapshot snapshot = table.snapshot(branch);
-    int inspected = 0;
-    while (snapshot != null && inspected < recentSnapshotLookback) {
+    int matched = 0;
+    int visited = 0;
+    while (snapshot != null && matched < recentSnapshotLookback && visited < RECENT_SNAPSHOT_WALK_LIMIT) {
       Map<String, String> summary = snapshot.summary();
       if (flinkJobId.equals(summary.get(FLINK_JOB_ID))
           && (summary.get(OPERATOR_ID) == null || operatorId.equals(summary.get(OPERATOR_ID)))) {
@@ -431,11 +456,12 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         for (DeleteFile file : snapshot.addedDeleteFiles(table.io())) {
           paths.add(file.path());
         }
+        matched++;
       }
 
       Long parentSnapshotId = snapshot.parentId();
       snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
-      inspected++;
+      visited++;
     }
 
     return paths;
@@ -510,6 +536,22 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         // to data files from txn1. Committing the merged one will lead to the incorrect delete
         // semantic.
         WriteResult result = e.getValue();
+
+        // AFFIRM: dropAlreadyCommittedFiles can leave a checkpoint entry with zero data files and
+        // zero delete files (a full duplicate). Committing an empty RowDelta here would be a
+        // pointless no-op snapshot at best; at worst, if that empty commit is ever rejected by
+        // something other than CommitStateUnknownException, the exception propagates out of
+        // commitUpToCheckpoint before pendingMap.clear() runs, leaving later, genuinely-new entries
+        // in this same batch stuck pending for a retry. Skip it entirely instead.
+        if (result.dataFiles().length == 0 && result.deleteFiles().length == 0) {
+          LOG.info(
+              "Skipping commit for checkpoint {} to table {} branch {}: fully deduped as already "
+                  + "committed, nothing left to write.",
+              e.getKey(),
+              table.name(),
+              branch);
+          continue;
+        }
 
         // Row delta validations are not needed for streaming changes that write equality deletes.
         // Equality deletes are applied to data in all previous sequence numbers, so retries may
