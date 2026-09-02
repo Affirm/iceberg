@@ -24,13 +24,16 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DuplicateRegistrationRepair;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SortOrder;
@@ -85,7 +88,8 @@ public class RewriteDataFilesSparkAction
           OUTPUT_SPEC_ID,
           REMOVE_DANGLING_DELETES,
           BinPackRewriteFilePlanner.MAX_FILES_TO_REWRITE,
-          VALIDATE_DUPLICATE_FILE_REGISTRATIONS);
+          VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+          RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
 
   private static final int DUPLICATE_REGISTRATION_REPORT_LIMIT = 10;
 
@@ -228,34 +232,37 @@ public class RewriteDataFilesSparkAction
   }
 
   /**
-   * AFFIRM: fails if any live data file path is registered at more than one data sequence number.
+   * AFFIRM: finds every live file path (data or delete) registered at more than one data
+   * sequence number and, depending on {@link RewriteDataFiles#RESOLVE_DUPLICATE_FILE_REGISTRATIONS},
+   * either repairs it or fails the action.
    *
-   * <p>Rewriting such a table silently corrupts it. {@code DataFileSet} and {@code DeleteFileSet}
-   * both key file identity on location alone, and a file's data sequence number lives on the
-   * manifest entry rather than on the {@code ContentFile}, so the two registrations cannot be told
-   * apart. The data side removes one of the two, because the collapsed {@code DataFile} carries a
-   * single {@code manifestLocation()} and the other manifest is never opened. The delete side
-   * removes both, because {@code SparkContentFile} does not override {@code manifestLocation()} and
-   * every manifest is therefore filtered. The surviving data registration is left with no delete
-   * file covering it, and rows that were correctly suppressed become visible.
+   * <p>Rewriting a table with a duplicate registration silently corrupts it. {@code DataFileSet}
+   * and {@code DeleteFileSet} both key file identity on location alone, and a file's data
+   * sequence number lives on the manifest entry rather than on the {@code ContentFile}, so the
+   * two registrations cannot be told apart. The data side removes one of the two, because the
+   * collapsed {@code DataFile} carries a single {@code manifestLocation()} and the other
+   * manifest is never opened. The delete side removes both, because {@code SparkContentFile}
+   * does not override {@code manifestLocation()} and every manifest is therefore filtered. The
+   * surviving data registration is left with no delete file covering it, and rows that were
+   * correctly suppressed become visible.
    *
-   * <p>Costs one scan of the entries metadata table, projecting two columns.
+   * <p>Costs one scan of the entries metadata table, projecting three columns.
    */
   @VisibleForTesting
   void validateNoDuplicateFileRegistrations() {
-    List<Row> duplicates =
-        loadMetadataTable(table, MetadataTableType.ENTRIES)
-            // live data file entries only: content 0 is DATA, status 2 is DELETED
-            .filter("data_file.content == 0 AND status < 2")
-            .selectExpr("data_file.file_path as file_path", "sequence_number")
-            .distinct()
-            .groupBy("file_path")
-            .count()
-            .filter("count > 1")
-            .limit(DUPLICATE_REGISTRATION_REPORT_LIMIT + 1)
-            .collectAsList();
+    List<Row> duplicates = findDuplicateFileRegistrations();
 
     if (duplicates.isEmpty()) {
+      return;
+    }
+
+    boolean resolveDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
+    if (resolveDuplicateFileRegistrations) {
+      repairDuplicateFileRegistrations(duplicates);
       return;
     }
 
@@ -263,21 +270,102 @@ public class RewriteDataFilesSparkAction
     String sample =
         duplicates.stream()
             .limit(DUPLICATE_REGISTRATION_REPORT_LIMIT)
-            .map(row -> String.format("%s (%d sequence numbers)", row.getString(0), row.getLong(1)))
+            .map(
+                row -> {
+                  String path = row.getAs("file_path");
+                  long distinctSequenceNumbers = row.getAs("distinct_sequence_numbers");
+                  return String.format("%s (%d sequence numbers)", path, distinctSequenceNumbers);
+                })
             .collect(Collectors.joining(", "));
 
     throw new ValidationException(
-        "Cannot rewrite %s: %s%d data file path(s) are registered at more than one data sequence "
-            + "number. Compaction cannot handle that safely and would turn it into duplicate rows. "
-            + "This usually follows a commit retried after its outcome became unknown. "
-            + "Affected: %s%s. Resolve the duplicate registrations first, or set %s=false to "
-            + "proceed anyway and accept the risk.",
+        "Cannot rewrite %s: %d file path(s) (data or delete) are registered at more than one "
+            + "data sequence number. Compaction cannot handle that safely and would turn it into "
+            + "duplicate rows. This usually follows a commit retried after its outcome became "
+            + "unknown. Affected (showing up to %d): %s%s. Resolve the duplicate registrations "
+            + "first, set %s=true to repair automatically, or set %s=false to proceed anyway and "
+            + "accept the risk.",
         table.name(),
-        truncated ? "at least " : "",
-        Math.min(duplicates.size(), DUPLICATE_REGISTRATION_REPORT_LIMIT),
+        duplicates.size(),
+        DUPLICATE_REGISTRATION_REPORT_LIMIT,
         sample,
         truncated ? ", ..." : "",
+        RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
         VALIDATE_DUPLICATE_FILE_REGISTRATIONS);
+  }
+
+  /**
+   * AFFIRM: returns one row per live file path (data or delete) that is registered at more than
+   * one distinct live data sequence number, with columns {@code file_path}, {@code content}
+   * (the lowest live registration's content type -- content does not vary across duplicate
+   * registrations of the same physical file), {@code keep_sequence_number} (the lowest live data
+   * sequence number registered for that path), and {@code distinct_sequence_numbers} (how many
+   * distinct sequence numbers that path is live at). Empty if the table has no such path.
+   */
+  private List<Row> findDuplicateFileRegistrations() {
+    String tempView =
+        "affirm_duplicate_registrations_" + UUID.randomUUID().toString().replace("-", "");
+    loadMetadataTable(table, MetadataTableType.ENTRIES)
+        .filter("status < 2") // live entries only; status 2 is DELETED
+        .selectExpr(
+            "data_file.file_path as file_path", "data_file.content as content", "sequence_number")
+        .distinct()
+        .createOrReplaceTempView(tempView);
+    try {
+      return spark()
+          .sql(
+              String.format(
+                  "SELECT file_path, min(content) as content, "
+                      + "min(sequence_number) as keep_sequence_number, "
+                      + "count(distinct sequence_number) as distinct_sequence_numbers "
+                      + "FROM %s GROUP BY file_path "
+                      + "HAVING count(distinct sequence_number) > 1",
+                  tempView))
+          .collectAsList();
+    } finally {
+      spark().catalog().dropTempView(tempView);
+    }
+  }
+
+  /**
+   * AFFIRM: repairs every duplicated file path found by {@link #findDuplicateFileRegistrations()}
+   * in a single commit, then refreshes {@code table} so the caller plans the rewrite against the
+   * corrected metadata.
+   *
+   * <p>For each path, keeps the lowest live data sequence number and drops every other live
+   * registration of that path. This is metadata-only: no physical file is touched, and the
+   * underlying file is never at risk of being treated as orphaned, because the kept registration
+   * still references its exact location. See {@link DuplicateRegistrationRepair} for why the
+   * lowest sequence number, specifically, must be the one kept.
+   */
+  private void repairDuplicateFileRegistrations(List<Row> duplicates) {
+    DuplicateRegistrationRepair repair =
+        new DuplicateRegistrationRepair(table.name(), ((HasTableOperations) table).operations());
+
+    for (Row row : duplicates) {
+      String path = row.getAs("file_path");
+      int content = row.getAs("content");
+      long keepSequenceNumber = row.getAs("keep_sequence_number");
+      if (content == 0) {
+        // FileContent.DATA
+        repair.keepDataFile(path, keepSequenceNumber);
+      } else {
+        // FileContent.POSITION_DELETES or FileContent.EQUALITY_DELETES
+        repair.keepDeleteFile(path, keepSequenceNumber);
+      }
+    }
+
+    repair.commit();
+    table.refresh();
+
+    LOG.warn(
+        "Repaired {} duplicate file registration(s) in {} before compaction: kept the lowest "
+            + "live data sequence number for each path and dropped every other live "
+            + "registration. This usually follows a commit retried after its outcome became "
+            + "unknown ({}).",
+        duplicates.size(),
+        table.name(),
+        RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
   }
 
   private void init(long startingSnapshotId) {

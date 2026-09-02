@@ -78,6 +78,10 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   // count of manifests that were rewritten with different manifest entry status during filtering
   private final AtomicInteger replacedManifestsCount = new AtomicInteger(0);
 
+  // AFFIRM: path -> the one data sequence number at that path which must survive; every other
+  // live registration of that same path is a duplicate to be dropped. See
+  // #dropDuplicateRegistrations for why the lowest sequence number is always the one kept.
+  private final Map<String, Long> duplicateRegistrationKeepSequence = Maps.newHashMap();
   private Expression deleteExpression = Expressions.alwaysFalse();
   private long minSequenceNumber = 0;
   private boolean failAnyDelete = false;
@@ -195,11 +199,62 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
     deletePaths.add(path);
   }
 
+  /**
+   * AFFIRM: repairs a file that was registered more than once at different data sequence
+   * numbers, keeping exactly one registration per path and dropping the rest.
+   *
+   * <p>A single physical file registered twice is not something a healthy writer produces. It
+   * arises when a commit is retried after its outcome became unknown (for example {@link
+   * org.apache.iceberg.exceptions.CommitStateUnknownException}) and the retry re-registers a
+   * WriteResult that had in fact already been applied. Left alone, this corrupts the next
+   * compaction: {@code DataFileSet}/{@code DeleteFileSet} key file identity on location alone, so
+   * the data side collapses the two registrations into one manifest reference and only removes
+   * one of them, while the delete side has no sequence number to key on at all and removes both
+   * -- leaving the surviving data registration with no delete coverage and resurrecting rows that
+   * were correctly suppressed.
+   *
+   * <p>The value in {@code keepSequenceNumberByPath} for each path MUST be the lowest live data
+   * sequence number registered for that path, not an arbitrary choice. Any delete file committed
+   * between two duplicate registrations has a sequence number greater than the lower one, so it
+   * continues to cover a registration kept at the lower sequence number. Keeping the higher one
+   * instead would silently drop that coverage and reproduce the exact defect this repairs.
+   *
+   * <p>Applies uniformly regardless of content type: a duplicate registration of a delete file is
+   * exactly as dangerous to whatever later reads it as a duplicate data file registration is, so
+   * both filter managers ({@code DataFile} and {@code DeleteFile}) are driven the same way.
+   *
+   * @param keepSequenceNumberByPath a map from file location to the one live data sequence
+   *     number at that location which must be kept; every other live registration at that
+   *     location is deleted from the new snapshot
+   */
+  protected void dropDuplicateRegistrations(Map<String, Long> keepSequenceNumberByPath) {
+    Preconditions.checkNotNull(
+        keepSequenceNumberByPath, "Cannot drop duplicate registrations using: null");
+    if (keepSequenceNumberByPath.isEmpty()) {
+      return;
+    }
+    invalidateFilteredCache();
+    this.duplicateRegistrationKeepSequence.putAll(keepSequenceNumberByPath);
+    this.allDeletesReferenceManifests = false;
+  }
+
+  // AFFIRM: true if this exact live registration (this path at this data sequence number) is a
+  // duplicate that must be dropped, i.e. a *different* sequence number was chosen to survive for
+  // this same path.
+  private boolean isDuplicateRegistrationToDrop(F file, ManifestEntry<F> entry) {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return false;
+    }
+    Long keepSequenceNumber = duplicateRegistrationKeepSequence.get(file.location().toString());
+    return keepSequenceNumber != null && !keepSequenceNumber.equals(entry.dataSequenceNumber());
+  }
+
   boolean containsDeletes() {
     return !deletePaths.isEmpty()
         || !deleteFiles.isEmpty()
         || deleteExpression != Expressions.alwaysFalse()
-        || !dropPartitions.isEmpty();
+        || !dropPartitions.isEmpty()
+        || !duplicateRegistrationKeepSequence.isEmpty();
   }
 
   /**
@@ -441,6 +496,11 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
       return ManifestFileUtil.canContainAny(manifest, deleteFilePartitions, specsById);
     } else if (!removedDataFilePaths.isEmpty()) {
       return true;
+    } else if (!duplicateRegistrationKeepSequence.isEmpty()) {
+      // AFFIRM: a duplicate registration can be in any manifest of either content type; no
+      // cheap partition/path pre-filter is available, so every manifest must be opened. This
+      // repair path is rare by construction, so the extra scan cost is acceptable.
+      return true;
     }
 
     return false;
@@ -461,6 +521,7 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
           deletePaths.contains(file.location())
               || deleteFiles.contains(file)
               || dropPartitions.contains(file.specId(), file.partition())
+              || isDuplicateRegistrationToDrop(file, entry)
               || (isDelete
                   && entry.isLive()
                   && entry.dataSequenceNumber() > 0
@@ -511,11 +572,13 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
                 entry -> {
                   F file = entry.file();
                   boolean isDanglingDV = isDelete && isDanglingDV((DeleteFile) file);
+                  boolean isDuplicateRegistrationDrop = isDuplicateRegistrationToDrop(file, entry);
                   boolean markedForDelete =
                       isDanglingDV
                           || deletePaths.contains(file.location())
                           || deleteFiles.contains(file)
                           || dropPartitions.contains(file.specId(), file.partition())
+                          || isDuplicateRegistrationDrop
                           || (isDelete
                               && entry.isLive()
                               && entry.dataSequenceNumber() > 0
@@ -533,9 +596,15 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
                     if (allRowsMatch) {
                       writer.delete(entry);
                       F fileCopy = file.copyWithoutStats();
-                      // add the file here in case it was deleted using an expression. The
-                      // DeleteManifestFilterManager will then remove its matching DV
-                      deleteFiles.add(fileCopy);
+                      if (!isDuplicateRegistrationDrop) {
+                        // AFFIRM: skip for a duplicate-registration drop -- the path itself is
+                        // not gone, a sibling entry at a different sequence number still lives
+                        // at this exact location. filesToBeDeleted() below feeds
+                        // DeleteFileFilterManager#removeDanglingDeletesFor; adding this path
+                        // there would make it drop a DV that still legitimately covers the
+                        // surviving entry, reproducing this same class of defect.
+                        deleteFiles.add(fileCopy);
+                      }
 
                       if (deletedFiles.contains(file)) {
                         LOG.warn(

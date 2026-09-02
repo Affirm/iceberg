@@ -119,28 +119,53 @@ public interface RewriteDataFiles
   boolean REMOVE_DANGLING_DELETES_DEFAULT = false;
 
   /**
-   * Validate, before planning any rewrite, that no live data file path is registered at more than
-   * one data sequence number.
+   * Validate, before planning any rewrite, that no live file path (data or delete) is registered
+   * at more than one data sequence number.
    *
-   * <p>A single physical data file registered twice is not something a healthy writer produces. It
+   * <p>A single physical file registered twice is not something a healthy writer produces. It
    * arises when a commit is retried after its outcome became unknown (for example {@link
    * org.apache.iceberg.exceptions.CommitStateUnknownException}) and the retry re-registers a
    * WriteResult that had in fact already been applied.
    *
-   * <p>Such a table cannot be safely compacted. File identity in the rewrite path is keyed on
-   * location alone, so the two registrations are indistinguishable: the data side removes one of
-   * them while the delete side removes both of the corresponding delete-file registrations. The
-   * surviving data registration is then left with no delete file covering it and previously
+   * <p>Such a table cannot be safely compacted as-is. File identity in the rewrite path is keyed
+   * on location alone, so the two registrations are indistinguishable: the data side removes one
+   * of them while the delete side removes both of the corresponding delete-file registrations.
+   * The surviving data registration is then left with no delete file covering it and previously
    * suppressed rows become visible.
    *
-   * <p>When enabled and a duplicate registration is found, the action fails before making any
-   * commit. Set to false only to compact such a table deliberately, having accepted that risk.
+   * <p>When enabled and a duplicate registration is found, by default the action repairs it (see
+   * {@link #RESOLVE_DUPLICATE_FILE_REGISTRATIONS}) before planning any rewrite. Set this to false
+   * only to compact such a table without any check at all, having accepted that risk.
    *
    * <p>Defaults to true.
    */
   String VALIDATE_DUPLICATE_FILE_REGISTRATIONS = "validate-duplicate-file-registrations";
 
   boolean VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT = true;
+
+  /**
+   * When {@link #VALIDATE_DUPLICATE_FILE_REGISTRATIONS} finds a duplicate registration, repair it
+   * instead of failing the action.
+   *
+   * <p>For each duplicated path, the repair keeps the registration at the LOWEST live data
+   * sequence number and drops every other live registration of that same path, for both data and
+   * delete files. This is a metadata-only commit made before {@code planFileGroups()} runs; no
+   * physical file is touched, and the underlying file is never deleted from disk because the
+   * kept registration still references it.
+   *
+   * <p>Keeping the lowest sequence number is not an arbitrary choice: any delete file committed
+   * between two duplicate registrations has a sequence number greater than the lower one, so it
+   * continues to cover a registration kept at the lower sequence number. Keeping the higher one
+   * instead would silently drop that coverage and reproduce the exact defect this repairs.
+   *
+   * <p>Set to false to instead fail the action and leave the table for manual remediation -- the
+   * behavior before this property existed.
+   *
+   * <p>Defaults to true.
+   */
+  String RESOLVE_DUPLICATE_FILE_REGISTRATIONS = "resolve-duplicate-file-registrations";
+
+  boolean RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT = true;
 
   /**
    * Forces the rewrite job order based on the value.

@@ -202,6 +202,23 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
     deleteFilterManager.dropPartition(specId, partition);
   }
 
+  /**
+   * AFFIRM: repairs duplicate file registrations, keeping exactly one live registration per
+   * path and dropping the rest. See {@link ManifestFilterManager#dropDuplicateRegistrations} for
+   * why the lowest data sequence number per path must always be the one kept, for both data and
+   * delete files independently.
+   *
+   * @param keepDataFileSequenceNumberByPath path -> data sequence number to keep, for data files
+   * @param keepDeleteFileSequenceNumberByPath path -> data sequence number to keep, for delete
+   *     files
+   */
+  protected void dropDuplicateRegistrations(
+      Map<String, Long> keepDataFileSequenceNumberByPath,
+      Map<String, Long> keepDeleteFileSequenceNumberByPath) {
+    filterManager.dropDuplicateRegistrations(keepDataFileSequenceNumberByPath);
+    deleteFilterManager.dropDuplicateRegistrations(keepDeleteFileSequenceNumberByPath);
+  }
+
   /** Add a specific data file to be deleted in the new snapshot. */
   protected void delete(DataFile file) {
     filterManager.delete(file);
