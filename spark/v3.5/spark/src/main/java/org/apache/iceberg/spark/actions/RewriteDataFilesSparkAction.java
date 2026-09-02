@@ -32,6 +32,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DuplicateRegistrationRepair;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.MetadataTableType;
@@ -346,8 +347,7 @@ public class RewriteDataFilesSparkAction
       String path = row.getAs("file_path");
       int content = row.getAs("content");
       long keepSequenceNumber = row.getAs("keep_sequence_number");
-      if (content == 0) {
-        // FileContent.DATA
+      if (content == FileContent.DATA.id()) {
         repair.keepDataFile(path, keepSequenceNumber);
       } else {
         // FileContent.POSITION_DELETES or FileContent.EQUALITY_DELETES
@@ -362,7 +362,7 @@ public class RewriteDataFilesSparkAction
         "Repaired {} duplicate file registration(s) in {} before compaction: kept the lowest "
             + "live data sequence number for each path and dropped every other live "
             + "registration. This usually follows a commit retried after its outcome became "
-            + "unknown ({}).",
+            + "unknown. Set {}=false to require manual remediation instead of automatic repair.",
         duplicates.size(),
         table.name(),
         RESOLVE_DUPLICATE_FILE_REGISTRATIONS);

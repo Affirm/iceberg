@@ -490,17 +490,24 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   }
 
   private boolean canContainDroppedFiles(ManifestFile manifest) {
-    if (!deletePaths.isEmpty()) {
+    // AFFIRM: independent checks, not an else-if chain. deleteFiles/deletePaths,
+    // duplicateRegistrationKeepSequence, and removedDataFilePaths can in principle all be
+    // populated on the same ManifestFilterManager instance (they're independent predicates on
+    // the same class); an else-if here would let a deleteFiles partition-overlap check
+    // short-circuit past a real duplicate registration or dangling DV in a manifest outside that
+    // partition set, silently under-scanning.
+    if (!deletePaths.isEmpty()
+        || !duplicateRegistrationKeepSequence.isEmpty()
+        || !removedDataFilePaths.isEmpty()) {
+      // AFFIRM: no cheap partition/path pre-filter is available for a duplicate registration or
+      // a dangling DV's referenced data file -- either can be in any manifest of either content
+      // type -- so every manifest must be opened. Both repair paths are rare by construction, so
+      // the extra scan cost is acceptable.
       return true;
-    } else if (!deleteFiles.isEmpty()) {
+    }
+
+    if (!deleteFiles.isEmpty()) {
       return ManifestFileUtil.canContainAny(manifest, deleteFilePartitions, specsById);
-    } else if (!removedDataFilePaths.isEmpty()) {
-      return true;
-    } else if (!duplicateRegistrationKeepSequence.isEmpty()) {
-      // AFFIRM: a duplicate registration can be in any manifest of either content type; no
-      // cheap partition/path pre-filter is available, so every manifest must be opened. This
-      // repair path is rare by construction, so the extra scan cost is acceptable.
-      return true;
     }
 
     return false;

@@ -96,8 +96,8 @@ import org.apache.iceberg.deletes.PositionDeleteWriter;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
-import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
@@ -2388,9 +2388,135 @@ public class TestRewriteDataFilesAction extends TestBase {
     RewriteDataFilesSparkAction rewrite = basicRewrite(table);
     assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
 
+    // Must keep the LOWER sequence number specifically, not merely collapse to one registration
+    // at an arbitrary one -- keeping the higher would silently drop delete coverage on data
+    // committed between the two, which is the exact defect this repairs.
     assertThat(distinctLiveSequenceNumbersForPath(table, deleteFile.location().toString()))
         .as("Repair must keep exactly one registration -- the original, lowest sequence number")
         .isEqualTo(1);
+    shouldHaveMinSequenceNumberInPartition(
+        table, "data_file.file_path = '" + deleteFile.location() + "'", 1);
+  }
+
+  @TestTemplate
+  public void testRepairsMultipleDuplicateFileRegistrationsInOneBatch() {
+    Table table = createTablePartitioned(4, 2);
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table, null);
+    DataFile first = dataFiles.get(0);
+    DataFile second = dataFiles.get(1);
+    assertThat(first.location()).isNotEqualTo(second.location());
+
+    // Two independent duplicate-registration events on two different paths, as if two separate
+    // commits each hit the CommitStateUnknownException retry race.
+    table.newAppend().appendFile(first).commit();
+    table.newAppend().appendFile(second).commit();
+    assertThat(distinctLiveSequenceNumbersForPath(table, first.location().toString()))
+        .isEqualTo(2);
+    assertThat(distinctLiveSequenceNumbersForPath(table, second.location().toString()))
+        .isEqualTo(2);
+
+    int snapshotsBeforeRepair = Iterables.size(table.snapshots());
+
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table).binPack();
+    rewrite.validateAndInitOptions();
+    assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
+
+    assertThat(distinctLiveSequenceNumbersForPath(table, first.location().toString()))
+        .as("First duplicated path must be repaired")
+        .isEqualTo(1);
+    assertThat(distinctLiveSequenceNumbersForPath(table, second.location().toString()))
+        .as("Second duplicated path must be repaired in the same pass")
+        .isEqualTo(1);
+    assertThat(Iterables.size(table.snapshots()))
+        .as("Both paths must be repaired in a single commit, not one snapshot per path")
+        .isEqualTo(snapshotsBeforeRepair + 1);
+  }
+
+  @TestTemplate
+  public void testRepairsMixedDataAndDeleteFileRegistrationsTogether() {
+    // Restricted to v2 position deletes -- see testRepairsDuplicateDeleteFileRegistrations.
+    assumeThat(formatVersion).isEqualTo(2);
+
+    Table table = createTablePartitioned(4, 2);
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table, null);
+    DataFile duplicatedDataFile = dataFiles.get(0);
+    DeleteFile duplicatedDeleteFile = writePosDeletesToFile(table, dataFiles.get(1), 1).get(0);
+    table.newRowDelta().addDeletes(duplicatedDeleteFile).commit();
+
+    // Duplicate both a data file AND a delete file so a single repair call must correctly route
+    // each to keepDataFile vs keepDeleteFile rather than only ever exercising one branch.
+    table.newAppend().appendFile(duplicatedDataFile).commit();
+    table.newRowDelta().addDeletes(duplicatedDeleteFile).commit();
+    assertThat(distinctLiveSequenceNumbersForPath(table, duplicatedDataFile.location().toString()))
+        .isEqualTo(2);
+    assertThat(
+            distinctLiveSequenceNumbersForPath(table, duplicatedDeleteFile.location().toString()))
+        .isEqualTo(2);
+
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table).binPack();
+    rewrite.validateAndInitOptions();
+    assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
+
+    assertThat(distinctLiveSequenceNumbersForPath(table, duplicatedDataFile.location().toString()))
+        .as("Duplicated data file must be repaired via keepDataFile")
+        .isEqualTo(1);
+    assertThat(
+            distinctLiveSequenceNumbersForPath(table, duplicatedDeleteFile.location().toString()))
+        .as("Duplicated delete file must be repaired via keepDeleteFile in the same pass")
+        .isEqualTo(1);
+  }
+
+  @TestTemplate
+  public void testRepairsMoreThanTwoRegistrationsOfSamePath() {
+    Table table = createTablePartitioned(4, 2);
+    DataFile existing =
+        Iterables.getFirst(table.currentSnapshot().addedDataFiles(table.io()), null);
+    assertThat(existing).isNotNull();
+
+    // Three total live registrations of the same path at three distinct sequence numbers, as if
+    // the same commit were retried twice.
+    table.newAppend().appendFile(existing).commit();
+    table.newAppend().appendFile(existing).commit();
+    assertThat(distinctLiveSequenceNumbersForPath(table, existing.location().toString()))
+        .isEqualTo(3);
+
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table).binPack();
+    rewrite.validateAndInitOptions();
+    assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
+
+    assertThat(distinctLiveSequenceNumbersForPath(table, existing.location().toString()))
+        .as("Repair must collapse all but one registration, regardless of how many there are")
+        .isEqualTo(1);
+    shouldHaveMinSequenceNumberInPartition(
+        table, "data_file.file_path = '" + existing.location() + "'", 1);
+  }
+
+  @TestTemplate
+  public void testRepairThenCompactEndToEnd() {
+    Table table = createTablePartitioned(4, 2);
+    shouldHaveFiles(table, 8);
+    List<Object[]> originalData = currentData();
+
+    DataFile existing =
+        Iterables.getFirst(table.currentSnapshot().addedDataFiles(table.io()), null);
+    assertThat(existing).isNotNull();
+    table.newAppend().appendFile(existing).commit();
+
+    // Duplicating a live registration makes the same physical file's rows readable twice through
+    // a normal scan -- this is the actual production symptom, not just a metadata artifact.
+    assertThat(currentData())
+        .as("Sanity check: the duplicate registration is visible as duplicated rows before repair")
+        .hasSizeGreaterThan(originalData.size());
+
+    // Full path, default options: validate-duplicate-file-registrations=true and
+    // resolve-duplicate-file-registrations=true, so this must repair then successfully compact,
+    // not throw.
+    assertThatNoException().isThrownBy(() -> basicRewrite(table).binPack().execute());
+
+    assertEquals(
+        "Repair + compaction must produce exactly the original data, with no duplicate rows",
+        originalData,
+        currentData());
   }
 
   @TestTemplate
