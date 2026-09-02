@@ -19,6 +19,7 @@
 package org.apache.iceberg;
 
 import java.util.Map;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 
 /**
@@ -72,11 +73,20 @@ public class DuplicateRegistrationRepair
    * Marks {@code sequenceNumber} as the live data sequence number to keep for a duplicated data
    * file path. Every other live registration of that same path is dropped.
    *
+   * <p><b>Not validated by this method:</b> the caller alone is responsible for {@code
+   * sequenceNumber} actually being the lowest live one for {@code path}. This class has no cheap
+   * way to verify that without itself scanning the manifests it exists to avoid opening
+   * unnecessarily. Passing anything other than the true minimum silently reproduces the defect
+   * this class repairs.
+   *
    * @param path the duplicated data file's location
    * @param sequenceNumber the lowest live data sequence number registered for that path
    * @return this for method chaining
    */
   public DuplicateRegistrationRepair keepDataFile(String path, long sequenceNumber) {
+    Preconditions.checkNotNull(path, "path cannot be null");
+    Preconditions.checkArgument(
+        sequenceNumber >= 0, "sequenceNumber must not be negative: %s", sequenceNumber);
     keepDataFileSequenceNumberByPath.put(path, sequenceNumber);
     return this;
   }
@@ -85,11 +95,20 @@ public class DuplicateRegistrationRepair
    * Marks {@code sequenceNumber} as the live data sequence number to keep for a duplicated
    * delete file path. Every other live registration of that same path is dropped.
    *
+   * <p><b>Not validated by this method:</b> the caller alone is responsible for {@code
+   * sequenceNumber} actually being the lowest live one for {@code path}. This class has no cheap
+   * way to verify that without itself scanning the manifests it exists to avoid opening
+   * unnecessarily. Passing anything other than the true minimum silently reproduces the defect
+   * this class repairs.
+   *
    * @param path the duplicated delete file's location
    * @param sequenceNumber the lowest live data sequence number registered for that path
    * @return this for method chaining
    */
   public DuplicateRegistrationRepair keepDeleteFile(String path, long sequenceNumber) {
+    Preconditions.checkNotNull(path, "path cannot be null");
+    Preconditions.checkArgument(
+        sequenceNumber >= 0, "sequenceNumber must not be negative: %s", sequenceNumber);
     keepDeleteFileSequenceNumberByPath.put(path, sequenceNumber);
     return this;
   }
