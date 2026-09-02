@@ -445,7 +445,8 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
    * committer's own recent history -- otherwise a run of 5+ such snapshots between an ambiguous
    * commit and its retry would defeat this check for the exact #10765 scenario it exists to catch.
    */
-  private CharSequenceSet collectRecentlyCommittedFilePaths(String flinkJobId, String operatorId) {
+  private CharSequenceSet collectRecentlyCommittedFilePaths(
+      String newFlinkJobId, String operatorId) {
     table.refresh();
 
     CharSequenceSet paths = CharSequenceSet.empty();
@@ -456,7 +457,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         && matched < recentSnapshotLookback
         && visited < RECENT_SNAPSHOT_WALK_LIMIT) {
       Map<String, String> summary = snapshot.summary();
-      if (flinkJobId.equals(summary.get(FLINK_JOB_ID))
+      if (newFlinkJobId.equals(summary.get(FLINK_JOB_ID))
           && (summary.get(OPERATOR_ID) == null || operatorId.equals(summary.get(OPERATOR_ID)))) {
         for (DataFile file : snapshot.addedDataFiles(table.io())) {
           paths.add(file.path());
@@ -659,7 +660,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
    */
   @VisibleForTesting
   boolean verifyCommitEventuallySucceeded(
-      String flinkJobId, String operatorId, long checkpointId, String description) {
+      String newFlinkJobId, String operatorId, long checkpointId, String description) {
     long delayMs = commitStateUnknownVerifyInitialDelayMs;
     for (int attempt = 1; attempt <= commitStateUnknownMaxVerifyAttempts; attempt++) {
       try {
@@ -671,7 +672,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
       table.refresh();
       long observedCheckpointId =
-          SinkUtil.getMaxCommittedCheckpointId(table, flinkJobId, operatorId, branch);
+          SinkUtil.getMaxCommittedCheckpointId(table, newFlinkJobId, operatorId, branch);
       LOG.info(
           "Verifying ambiguous {} commit for checkpoint {} on table {} branch {}: attempt {}/{}, "
               + "observed max-committed-checkpoint-id {} for flinkJobId {} operatorId {}",
@@ -682,7 +683,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
           attempt,
           commitStateUnknownMaxVerifyAttempts,
           observedCheckpointId,
-          flinkJobId,
+          newFlinkJobId,
           operatorId);
       if (observedCheckpointId >= checkpointId) {
         return true;
