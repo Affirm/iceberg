@@ -2371,6 +2371,7 @@ public class TestRewriteDataFilesAction extends TestBase {
     assumeThat(formatVersion).isEqualTo(2);
 
     Table table = createTablePartitioned(4, 2);
+    table.refresh();
     List<DataFile> dataFiles = TestHelpers.dataFiles(table, null);
     DeleteFile deleteFile = writePosDeletesToFile(table, dataFiles.get(0), 1).get(0);
     table.newRowDelta().addDeletes(deleteFile).commit();
@@ -2401,6 +2402,7 @@ public class TestRewriteDataFilesAction extends TestBase {
   @TestTemplate
   public void testRepairsMultipleDuplicateFileRegistrationsInOneBatch() {
     Table table = createTablePartitioned(4, 2);
+    table.refresh();
     List<DataFile> dataFiles = TestHelpers.dataFiles(table, null);
     DataFile first = dataFiles.get(0);
     DataFile second = dataFiles.get(1);
@@ -2438,6 +2440,7 @@ public class TestRewriteDataFilesAction extends TestBase {
     assumeThat(formatVersion).isEqualTo(2);
 
     Table table = createTablePartitioned(4, 2);
+    table.refresh();
     List<DataFile> dataFiles = TestHelpers.dataFiles(table, null);
     DataFile duplicatedDataFile = dataFiles.get(0);
     DeleteFile duplicatedDeleteFile = writePosDeletesToFile(table, dataFiles.get(1), 1).get(0);
@@ -2469,6 +2472,7 @@ public class TestRewriteDataFilesAction extends TestBase {
   @TestTemplate
   public void testRepairsMoreThanTwoRegistrationsOfSamePath() {
     Table table = createTablePartitioned(4, 2);
+    table.refresh();
     DataFile existing =
         Iterables.getFirst(table.currentSnapshot().addedDataFiles(table.io()), null);
     assertThat(existing).isNotNull();
@@ -2522,6 +2526,11 @@ public class TestRewriteDataFilesAction extends TestBase {
   @TestTemplate
   public void testDuplicateDataFileRegistrationCheckCanBeDisabled() {
     Table table = createTablePartitioned(4, 2);
+    // AFFIRM: found via a real Thor build+test run -- without this refresh, currentSnapshot()
+    // is null (the Table handle predates the Spark write) and the very next line NPEs. Confirms
+    // this test was never actually verified before that run: nothing in this fork's tooling had
+    // compiled or executed any of it.
+    table.refresh();
     DataFile existing =
         Iterables.getFirst(table.currentSnapshot().addedDataFiles(table.io()), null);
     assertThat(existing).isNotNull();
