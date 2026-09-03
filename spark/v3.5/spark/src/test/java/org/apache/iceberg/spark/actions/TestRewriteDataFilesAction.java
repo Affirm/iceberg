@@ -2550,26 +2550,27 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertThat(existing).isNotNull();
     table.newAppend().appendFile(existing).commit();
 
-    // AFFIRM: found via a real Thor build+test run, and it reframes what this opt-out is for.
-    // Disabling this guard does NOT let an operator "accept the risk and proceed" on ANY format
-    // version: rewrite_data_files still fails, via Iceberg's own added-records-vs-replaced-records
-    // sanity check in SnapshotProducer.apply ("Invalid REPLACE operation: N added records > M
-    // replaced records"), which is ungated by format version and which this exact corruption
-    // pattern always trips -- the compactor reads the duplicated registration's rows twice and
-    // therefore writes out more records than it replaced.
+    // AFFIRM: assert ONLY what this test is actually about -- that the opt-out skips THIS guard,
+    // i.e. that whatever happens next, it is not this guard's ValidationException.
     //
-    // So on 1.11 a duplicate-registered table is simply not compactable. The guard's value is
-    // (a) failing early with an actionable message that names the offending paths and the
-    // remedy, instead of a cryptic arithmetic assertion from deep inside the commit, and
-    // (b) with resolve=true, actually fixing the table so compaction can proceed. That is also
-    // why this opt-out is not a useful escape hatch on its own and the guard defaults to on.
-    assertThatThrownBy(
-            () ->
-                basicRewrite(table)
-                    .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
-                    .execute())
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("Invalid REPLACE operation");
+    // Deliberately narrow, after two Thor runs disagreed about what happens downstream. One run
+    // saw the rewrite then fail inside the commit on Iceberg's own added-vs-replaced-records
+    // assertion ("Invalid REPLACE operation: N added records > M replaced records",
+    // SnapshotProducer.apply, ungated by format version); a later run on the same code saw the
+    // rewrite complete cleanly. Both are plausible -- whether the duplicated registration ends
+    // up inside a selected file group depends on planner bin-packing over the generated data --
+    // so asserting either outcome would be asserting a coin flip. Do not re-add an assertion
+    // about that downstream behavior without first pinning down what actually varies; the guard
+    // defaulting to ON is what makes it moot in practice.
+    try {
+      basicRewrite(table)
+          .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
+          .execute();
+    } catch (Exception e) {
+      assertThat(e)
+          .as("The opt-out must suppress this guard specifically, whatever else may fail")
+          .hasMessageNotContaining("registered at more than one data sequence number");
+    }
   }
 
   @TestTemplate

@@ -30,6 +30,7 @@ import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.spark.SparkTableUtil;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -86,7 +87,8 @@ final class DuplicateFileRegistrationGuard {
       return;
     }
 
-    boolean unsafeForAutoRepair = hasUnsafeDeletionVectorDuplicate(table, duplicates);
+    boolean unsafeForAutoRepair =
+        hasUnsafeDeletionVectorDuplicate(TableUtil.formatVersion(table), duplicates);
     if (resolve && !unsafeForAutoRepair) {
       repairDuplicateFileRegistrations(table, duplicates, resolvePropertyName);
       return;
@@ -144,9 +146,20 @@ final class DuplicateFileRegistrationGuard {
    * of defect this guard exists to prevent, through a path this guard cannot see. Refuse to
    * auto-repair the whole batch when this is possible; always require manual remediation for it,
    * regardless of the caller's resolve option.
+   *
+   * <p><b>This is defence-in-depth, not a live scenario on 1.11.</b> Verified while testing:
+   * {@code BaseRowDelta#validate} calls {@code validateAddedDVs} UNCONDITIONALLY on every
+   * {@code RowDelta} with a parent snapshot, so Iceberg 1.11 already refuses at commit time to
+   * add a second DV for a data file that has one ("Found concurrently added DV for file..."). A
+   * duplicated-DV registration therefore cannot be produced through the public write path at
+   * all -- an attempt to construct one in a test is rejected by that validation. This branch
+   * exists for a state arriving by some other route (a lower-level writer, a legacy table
+   * migrated in, or a future regression in that validation), where refusing is strictly better
+   * than guessing. Kept deliberately rather than deleted as dead code.
    */
-  private static boolean hasUnsafeDeletionVectorDuplicate(Table table, List<Row> duplicates) {
-    if (TableUtil.formatVersion(table) < 3) {
+  @VisibleForTesting
+  static boolean hasUnsafeDeletionVectorDuplicate(int formatVersion, List<Row> duplicates) {
+    if (formatVersion < 3) {
       return false;
     }
 

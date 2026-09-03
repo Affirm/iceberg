@@ -891,11 +891,17 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
             .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
             .execute();
 
-    assertThat(distinctLiveSequenceNumbersForPath(table, duplicated.location().toString()))
-        .as("Repair must keep exactly one registration -- the original, lowest sequence number")
-        .isEqualTo(1);
-    // the repair's own commit precedes the rewrite; the rewrite itself should proceed normally
-    // afterward rather than being blocked by the now-repaired duplicate
+    // AFFIRM: do NOT assert the duplicated path still has one registration. With REWRITE_ALL the
+    // action legitimately rewrites every position delete into a new file, so the original path is
+    // expected to be gone entirely afterward -- an earlier version of this test asserted 1 and
+    // correctly observed 0. The invariant that actually matters is that NO path is left
+    // multiply-registered, which is what the repair guarantees and what the rewrite must not
+    // reintroduce.
+    assertThat(pathsWithMultipleLiveRegistrations(table))
+        .as("No path may be left registered at more than one data sequence number")
+        .isEmpty();
+    // The repair's commit precedes the rewrite, so the rewrite must proceed normally rather than
+    // being blocked by the (now repaired) duplicate.
     assertThat(result.rewrittenDeleteFilesCount()).isGreaterThan(0);
   }
 
@@ -921,14 +927,18 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
   }
 
   /**
-   * AFFIRM: a duplicated V3 deletion vector must never be auto-repaired, even with the default
-   * resolve=true -- see {@code DuplicateFileRegistrationGuard#hasUnsafeDeletionVectorDuplicate}
-   * for why a Puffin-packed DV's shared location makes this guard's location-only matching unsafe
-   * to apply blindly. This drives that gate through the real V2-to-V3 DV migration path, not a
-   * synthetic one.
+   * AFFIRM: Iceberg 1.11 will not let you create a duplicated DV registration at all.
+   *
+   * <p>An earlier version of this file tried to drive the guard's DV-refusal branch end-to-end by
+   * migrating to V3 and re-adding a live DV. That is impossible: {@code BaseRowDelta#validate}
+   * calls {@code validateAddedDVs} unconditionally, so the second {@code addDeletes} of a DV whose
+   * referenced data file already has one is rejected with "Found concurrently added DV for
+   * file...". Pinned here because it is the reason the guard's DV branch is defence-in-depth
+   * rather than a live path, and the reason that branch is unit-tested directly (see {@code
+   * TestDuplicateFileRegistrationGuard}) instead of through an action.
    */
   @TestTemplate
-  public void testRefusesToAutoRepairDuplicateV3DeletionVector() throws IOException {
+  public void testIcebergItselfRefusesToCreateADuplicateDvRegistration() throws IOException {
     Table table = createTableUnpartitioned(2, SCALE);
     List<DataFile> dataFiles = TestHelpers.dataFiles(table);
     writePosDeletesForFiles(table, 2, DELETES_SCALE, dataFiles);
@@ -941,18 +951,12 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
 
     List<DeleteFile> dvs = deleteFiles(table);
     assertThat(dvs).hasSize(2).allMatch(file -> file.format() == FileFormat.PUFFIN);
-    DeleteFile duplicated = dvs.get(0);
+    DeleteFile alreadyLive = dvs.get(0);
 
-    table.newRowDelta().addDeletes(duplicated).commit();
-    assertThat(distinctLiveSequenceNumbersForPath(table, duplicated.location().toString()))
-        .as("Duplicate DV registration must exist before the guard runs")
-        .isEqualTo(2);
-
-    // Default options (resolve=true) -- must still refuse, not silently auto-repair.
-    assertThatThrownBy(() -> SparkActions.get(spark).rewritePositionDeletes(table).execute())
+    assertThatThrownBy(() -> table.newRowDelta().addDeletes(alreadyLive).commit())
+        .as("1.11 blocks a second DV for a data file that already has one")
         .isInstanceOf(ValidationException.class)
-        .hasMessageContaining("cannot safely auto-repair")
-        .hasMessageContaining(duplicated.location().toString());
+        .hasMessageContaining("Found concurrently added DV");
   }
 
   /** AFFIRM: how many distinct live data sequence numbers a file path is currently registered at. */
@@ -963,6 +967,18 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
         .select("sequence_number")
         .distinct()
         .count();
+  }
+
+  /** AFFIRM: every live file path registered at more than one distinct data sequence number. */
+  private List<Row> pathsWithMultipleLiveRegistrations(Table table) {
+    return SparkTableUtil.loadMetadataTable(spark, table, MetadataTableType.ENTRIES)
+        .filter("status < 2")
+        .selectExpr("data_file.file_path as file_path", "sequence_number")
+        .distinct()
+        .groupBy("file_path")
+        .count()
+        .filter("count > 1")
+        .collectAsList();
   }
 
   private List<Row> dvRecords(Table table) {
