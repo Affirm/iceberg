@@ -214,8 +214,13 @@ public class RewriteDataFilesSparkAction
     ImmutableRewriteDataFiles.Result result = resultBuilder.build();
 
     if (removeDanglingDeletes) {
+      // AFFIRM: skipDuplicateRegistrationCheck() because this invocation's
+      // duplicate-registration policy was already settled at the top of execute() -- either the
+      // guard ran and repaired, or the caller explicitly set
+      // validate-duplicate-file-registrations=false. Either way, re-deciding it here would be
+      // redundant at best and would override the caller's opt-out at worst.
       RemoveDanglingDeletesSparkAction action =
-          new RemoveDanglingDeletesSparkAction(spark(), table);
+          new RemoveDanglingDeletesSparkAction(spark(), table).skipDuplicateRegistrationCheck();
       int removedDeleteFiles = Iterables.size(action.execute().removedDeleteFiles());
       return result.withRemovedDeleteFilesCount(
           result.removedDeleteFilesCount() + removedDeleteFiles);
