@@ -61,6 +61,33 @@ public interface RewritePositionDeleteFiles
   int MAX_CONCURRENT_FILE_GROUP_REWRITES_DEFAULT = 5;
 
   /**
+   * AFFIRM: validate, before planning any rewrite, that no live file path (data or delete) is
+   * registered at more than one data sequence number.
+   *
+   * <p>Mirrors {@link RewriteDataFiles#VALIDATE_DUPLICATE_FILE_REGISTRATIONS} -- this action
+   * commits through the same {@code ManifestFilterManager} machinery and is reachable
+   * independently of {@code rewrite_data_files} (run standalone against a table, e.g. from an
+   * oncall/backfill notebook), so it needs the identical guard rather than assuming {@code
+   * rewrite_data_files} already ran first.
+   *
+   * <p>Defaults to true.
+   */
+  String VALIDATE_DUPLICATE_FILE_REGISTRATIONS = "validate-duplicate-file-registrations";
+
+  boolean VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT = true;
+
+  /**
+   * AFFIRM: when {@link #VALIDATE_DUPLICATE_FILE_REGISTRATIONS} finds a duplicate registration,
+   * repair it instead of failing the action. Mirrors {@link
+   * RewriteDataFiles#RESOLVE_DUPLICATE_FILE_REGISTRATIONS}.
+   *
+   * <p>Defaults to true.
+   */
+  String RESOLVE_DUPLICATE_FILE_REGISTRATIONS = "resolve-duplicate-file-registrations";
+
+  boolean RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT = true;
+
+  /**
    * Forces the rewrite job order based on the value.
    *
    * <ul>

@@ -252,6 +252,13 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   // validateDuplicateRegistrationSurvivorsPresent for why: a commit retry against a base a
   // concurrent writer already changed must not silently drop every registration of a path whose
   // survivor vanished out from under it).
+  //
+  // Every caller MUST evaluate this method unconditionally into a local variable before
+  // combining it into a || chain, never call it inline as one term of that chain. Java
+  // short-circuits ||, so an earlier term in the chain matching the same entry (e.g.
+  // deletePaths/deleteFiles/dropPartitions) would skip this call, and skip its survivor-seen
+  // side effect, even though the entry IS the survivor. See both call sites below for the
+  // pattern to follow.
   private boolean isDuplicateRegistrationToDrop(F file, ManifestEntry<F> entry) {
     if (duplicateRegistrationKeepSequence.isEmpty()) {
       return false;
@@ -331,6 +338,19 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * either. That is silent data loss with the commit reporting success. Failing loudly here
    * instead means the whole commit attempt aborts; a subsequent retry (or a fresh invocation of
    * the guard) re-evaluates against the latest state rather than acting on stale intent.
+   *
+   * <p><b>Known, accepted tradeoff (raised in review on Affirm/iceberg#6,
+   * pullrequestreview-5105776910):</b> this fails the ENTIRE batch's commit if even one
+   * duplicated path's survivor goes missing, even when every other path in the batch is still
+   * perfectly repairable. A table with many duplicated paths where one unrelated concurrent
+   * write touches just one of them will have the whole {@code rewrite_data_files} attempt fail,
+   * not just that one path. Deliberately not implemented as "drop the poisoned path and retry
+   * the rest": that would mean silently mutating repair intent baked into an EARLIER scan under
+   * exactly the CAS-conflict conditions this method exists to be paranoid about, which is a much
+   * larger correctness surface than the fail-and-let-a-fresh-run-rescan behavior chosen here.
+   * The whole-batch failure is safe and self-healing (the next scheduled compaction run
+   * re-scans and repairs whatever is still actually duplicated) at the cost of availability for
+   * that one run. Revisit only if this proves to bite in practice, not preemptively.
    */
   private void validateDuplicateRegistrationSurvivorsPresent() {
     if (duplicateRegistrationKeepSequence.isEmpty()) {
@@ -341,16 +361,15 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
         Sets.difference(
                 duplicateRegistrationKeepSequence.keySet(), duplicateRegistrationSurvivorsSeen)
             .immutableCopy();
-    if (!missing.isEmpty()) {
-      throw new ValidationException(
-          "Cannot repair duplicate file registrations: the intended surviving registration was "
-              + "not found live for %d path(s), most likely because a concurrent commit already "
-              + "changed them since this repair's scan. Aborting this commit attempt rather than "
-              + "risking dropping every live registration of an affected path. A retry will "
-              + "re-evaluate against the latest state. Affected: %s",
-          missing.size(),
-          COMMA.join(missing));
-    }
+    ValidationException.check(
+        missing.isEmpty(),
+        "Cannot repair duplicate file registrations: the intended surviving registration was "
+            + "not found live for %d path(s), most likely because a concurrent commit already "
+            + "changed them since this repair's scan. Aborting this commit attempt rather than "
+            + "risking dropping every live registration of an affected path. A retry will "
+            + "re-evaluate against the latest state. Affected: %s",
+        missing.size(),
+        COMMA.join(missing));
   }
 
   // Use the current set of referenced manifests as a source of truth when it's a subset of all
@@ -588,11 +607,17 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
 
     for (ManifestEntry<F> entry : reader.liveEntries()) {
       F file = entry.file();
+      // AFFIRM: evaluated unconditionally, not inline in the || chain below. This method's
+      // "mark the survivor as seen" side effect only fires when this call is actually reached;
+      // placing it after an earlier condition in a || chain would let Java's short-circuiting
+      // skip it whenever that earlier condition already matched the same entry, wrongly leaving
+      // a live survivor unrecorded.
+      boolean isDuplicateRegistrationDrop = isDuplicateRegistrationToDrop(file, entry);
       boolean markedForDelete =
           deletePaths.contains(file.location())
               || deleteFiles.contains(file)
               || dropPartitions.contains(file.specId(), file.partition())
-              || isDuplicateRegistrationToDrop(file, entry)
+              || isDuplicateRegistrationDrop
               || (isDelete
                   && entry.isLive()
                   && entry.dataSequenceNumber() > 0
