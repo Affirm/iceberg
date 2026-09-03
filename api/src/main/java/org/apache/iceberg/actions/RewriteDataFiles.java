@@ -149,9 +149,9 @@ public interface RewriteDataFiles
    *
    * <p>For each duplicated path, the repair keeps the registration at the LOWEST live data
    * sequence number and drops every other live registration of that same path, for both data and
-   * delete files. This is a metadata-only commit made before {@code planFileGroups()} runs; no
-   * physical file is touched, and the underlying file is never deleted from disk because the
-   * kept registration still references it.
+   * delete files. This is a metadata-only commit made before the rewrite is planned; no physical
+   * file is touched, and the underlying file is never deleted from disk because the kept
+   * registration still references it.
    *
    * <p>Keeping the lowest sequence number is not an arbitrary choice: any delete file committed
    * between two duplicate registrations has a sequence number greater than the lower one, so it
