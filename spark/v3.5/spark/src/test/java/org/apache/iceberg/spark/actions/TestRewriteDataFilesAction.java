@@ -2125,6 +2125,18 @@ public class TestRewriteDataFilesAction extends TestBase {
         .count();
   }
 
+  /** AFFIRM: the single live sequence number for a path known to have exactly one registration. */
+  protected long soleLiveSequenceNumberForPath(Table table, String path) {
+    return SparkTableUtil.loadMetadataTable(spark, table, MetadataTableType.ENTRIES)
+        .filter("status < 2")
+        .filter("data_file.file_path = '" + path + "'")
+        .select("sequence_number")
+        .distinct()
+        .as(Encoders.LONG())
+        .collectAsList()
+        .get(0);
+  }
+
   protected void shouldHaveSnapshots(Table table, int expectedSnapshots) {
     table.refresh();
     int actualSnapshots = Iterables.size(table.snapshots());
@@ -2321,6 +2333,11 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertThat(distinctLiveSequenceNumbersForPath(table, deleteFile.location().toString()))
         .as("Sanity check: exactly one registration before duplicating it")
         .isEqualTo(1);
+    // AFFIRM: captured rather than assumed to be 1 -- createTablePartitioned's data write is
+    // itself the table's first commit, so this delete file's first commit is already sequence
+    // 2, not 1. Capturing the true value here, instead of hardcoding one, is what caught that.
+    long originalSequenceNumber =
+        soleLiveSequenceNumberForPath(table, deleteFile.location().toString());
 
     // Re-register the already-live delete file at a second data sequence number -- the delete
     // side's version of the same CommitStateUnknownException retry scenario.
@@ -2340,7 +2357,7 @@ public class TestRewriteDataFilesAction extends TestBase {
         .as("Repair must keep exactly one registration -- the original, lowest sequence number")
         .isEqualTo(1);
     shouldHaveMinSequenceNumberInPartition(
-        table, "data_file.file_path = '" + deleteFile.location() + "'", 1);
+        table, "data_file.file_path = '" + deleteFile.location() + "'", originalSequenceNumber);
   }
 
   @TestTemplate
