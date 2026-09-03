@@ -286,6 +286,10 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * combines the two today ({@link DuplicateRegistrationRepair} sets neither), and doing so would
    * hit the silent path described above. Left as a known gap rather than a half-check.
    */
+  // CollectionUndefinedEquality: deletePaths is a CharSequenceSet, which wraps its elements for
+  // comparison, so a String lookup is well-defined here. Same suppression and reason as
+  // validateRequiredDeletes and the two filtering methods below.
+  @SuppressWarnings("CollectionUndefinedEquality")
   private void validateNoContradictoryDuplicateRegistrationIntent() {
     if (duplicateRegistrationKeepSequence.isEmpty()) {
       return;
