@@ -527,6 +527,63 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
     assertThat(actualAfter).containsExactlyInAnyOrderElementsOf(expectedAfter);
   }
 
+  /**
+   * AFFIRM: the defect this action's new duplicate-registration guard exists to prevent, driven
+   * deliberately rather than incidentally.
+   *
+   * <p>Without the guard, this action reproduces the "delete side removes 2-of-2" half of the
+   * production incident. {@code doExecute} hands each dangling delete file to {@code
+   * RewriteFiles#deleteFile}, whose identity for manifest filtering is {@code DeleteFileSet}'s key
+   * -- {@code (location, contentOffset, contentSizeInBytes)} -- which is IDENTICAL across two live
+   * registrations of the same physical file at different data sequence numbers. So dropping the
+   * one genuinely-dangling registration would also drop the sibling registration that still
+   * legitimately covers live data, resurrecting the rows it suppressed.
+   *
+   * <p>Here a delete file that DOES still cover live data is duplicated. Nothing about it is
+   * dangling, so a correct run must remove nothing at all -- and, because the guard repairs the
+   * duplicate first, must leave exactly one live registration of it behind rather than zero.
+   */
+  @TestTemplate
+  public void testDoesNotDropADuplicatedDeleteFileThatStillCoversLiveData() {
+    // v2 position deletes only: a duplicated V3 deletion vector is deliberately refused rather
+    // than auto-repaired (a Puffin file legitimately holds several distinct delete files at one
+    // location), which is covered separately in TestRewritePositionDeleteFilesAction.
+    assumeThat(formatVersion).isEqualTo(2);
+    setupPartitionedTable();
+
+    table.newAppend().appendFile(FILE_A).commit();
+    DeleteFile fileADeletes = fileADeletes();
+    table.newRowDelta().addDeletes(fileADeletes).commit();
+
+    // Duplicate the delete file's registration: the CommitStateUnknownException-retry shape,
+    // applied to the delete side. FILE_A is still live, so neither registration is dangling.
+    table.newRowDelta().addDeletes(fileADeletes).commit();
+
+    long liveRegistrationsBefore =
+        liveEntries().stream().filter(e -> e._2().equals(fileADeletes.location())).count();
+    assertThat(liveRegistrationsBefore)
+        .as("Both delete-file registrations must be live before the action runs")
+        .isEqualTo(2);
+
+    RemoveDanglingDeleteFiles.Result result =
+        SparkActions.get().removeDanglingDeleteFiles(table).execute();
+
+    assertThat(result.removedDeleteFiles())
+        .as("Nothing here is dangling -- FILE_A is live, so no delete file may be removed")
+        .isEmpty();
+
+    long liveRegistrationsAfter =
+        liveEntries().stream().filter(e -> e._2().equals(fileADeletes.location())).count();
+    assertThat(liveRegistrationsAfter)
+        .as(
+            "The guard must repair the duplicate to exactly one live registration -- not zero "
+                + "(which is the 2-of-2 removal bug) and not two (unrepaired)")
+        .isEqualTo(1);
+    assertThat(liveEntries())
+        .as("The data file it covers must still be live")
+        .anyMatch(e -> e._2().equals(FILE_A.location()));
+  }
+
   private List<Tuple2<Long, String>> liveEntries() {
     return spark
         .read()
