@@ -339,18 +339,54 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * instead means the whole commit attempt aborts; a subsequent retry (or a fresh invocation of
    * the guard) re-evaluates against the latest state rather than acting on stale intent.
    *
+   * <p><b>What does NOT trigger this: a concurrent streaming writer, however frequent --
+   * including an UPSERT writer.</b> This matters because our CDC tables are fed by a Flink upsert
+   * sink that commits every ~5 minutes and emits an equality delete for every row, so "every
+   * commit touches the delete side" is the steady state here, not an edge case. It is still safe,
+   * and the reason is structural rather than a property of appends:
+   *
+   * <ul>
+   *   <li>An upsert commits a {@code RowDelta} that only calls {@code addRows}/{@code addDeletes}
+   *       -- never {@code removeRows}/{@code removeDeletes}. So {@code deletePaths}, {@code
+   *       deleteFiles} and {@code dropPartitions} all stay EMPTY on that commit.
+   *   <li>With all three empty and no delete expression, {@code canContainDeletedFiles} returns
+   *       false for every pre-existing manifest, so those manifests are never opened or
+   *       rewritten and no existing entry can be marked DELETED. Note that {@code
+   *       canContainDeletedFiles} has no {@code minSequenceNumber} term -- which is also why
+   *       ordinary writer commits never clean up dangling equality deletes, i.e. the very reason
+   *       they accumulate on these tables. That accumulation is empirical confirmation of this
+   *       reading.
+   *   <li>Even when a commit does merge manifests, {@link ManifestWriter#existing} is
+   *       contractually required to preserve the original data sequence number, so a survivor
+   *       stays findable at exactly the sequence number the scan designated.
+   * </ul>
+   *
+   * <p>Nor does a long-running compaction widen the window: the repair is a separate
+   * metadata-only commit that lands BEFORE the rewrite is planned, so the rewrite's own duration
+   * is irrelevant here. Ordinary CAS contention on the rewrite's own commit is a separate,
+   * pre-existing concern that {@code partial-progress.enabled} addresses. The repair does add one
+   * more commit competing with the writer, but it is metadata-only, fast, and inherits the
+   * table's normal {@code commit.retry.*} budget.
+   *
+   * <p>Only an operation that explicitly removes or replaces that exact entry can trigger this:
+   * another compaction, a DELETE/MERGE/overwrite touching that file, a dedup or privacy-delete
+   * job, or another repair. None of those run on the streaming writer's cadence.
+   *
    * <p><b>Known, accepted tradeoff (raised in review on Affirm/iceberg#6,
    * pullrequestreview-5105776910):</b> this fails the ENTIRE batch's commit if even one
    * duplicated path's survivor goes missing, even when every other path in the batch is still
-   * perfectly repairable. A table with many duplicated paths where one unrelated concurrent
-   * write touches just one of them will have the whole {@code rewrite_data_files} attempt fail,
-   * not just that one path. Deliberately not implemented as "drop the poisoned path and retry
-   * the rest": that would mean silently mutating repair intent baked into an EARLIER scan under
+   * perfectly repairable. Deliberately not implemented as "drop the poisoned path and repair the
+   * rest": that would mean silently mutating repair intent baked into an EARLIER scan under
    * exactly the CAS-conflict conditions this method exists to be paranoid about, which is a much
    * larger correctness surface than the fail-and-let-a-fresh-run-rescan behavior chosen here.
-   * The whole-batch failure is safe and self-healing (the next scheduled compaction run
-   * re-scans and repairs whatever is still actually duplicated) at the cost of availability for
-   * that one run. Revisit only if this proves to bite in practice, not preemptively.
+   *
+   * <p>The whole-batch failure is safe, and self-healing PROVIDED the interfering operation is
+   * not itself recurring: the next scheduled compaction run re-scans and repairs whatever is
+   * still actually duplicated. If some job repeatedly removes the same survivor on a cadence
+   * shorter than the repair takes to commit, repair would keep failing and the table would stay
+   * duplicated -- detectable as the same table failing this check run after run, which is the
+   * signal the follow-up repair-frequency metric should alert on. Revisit the partial-repair
+   * design only if that is actually observed, not preemptively.
    */
   private void validateDuplicateRegistrationSurvivorsPresent() {
     if (duplicateRegistrationKeepSequence.isEmpty()) {

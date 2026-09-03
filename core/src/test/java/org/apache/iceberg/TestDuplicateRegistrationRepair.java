@@ -400,6 +400,49 @@ public class TestDuplicateRegistrationRepair extends TestBase {
   }
 
   @TestTemplate
+  public void testConcurrentUpsertWritesDoNotStarveTheRepair() {
+    // Pins the load-bearing claim in validateDuplicateRegistrationSurvivorsPresent's javadoc.
+    // Modelled on the actual production writer, which is NOT an append-only sink: it is a Flink
+    // UPSERT sink committing every ~5 minutes that emits an equality delete for every row, so
+    // every one of its commits touches the delete side. The claim under test is that such a
+    // writer still cannot make a designated survivor vanish, because a RowDelta that only calls
+    // addRows/addDeletes leaves deletePaths/deleteFiles/dropPartitions empty, which makes
+    // canContainDeletedFiles false for every pre-existing manifest -- so nothing is reopened and
+    // no existing entry is marked DELETED.
+    assumeThat(formatVersion).isEqualTo(2);
+
+    table.newAppend().appendFile(FILE_A).commit();
+    long survivorSeq = table.currentSnapshot().sequenceNumber();
+    table.newAppend().appendFile(FILE_A).commit();
+    assertThat(liveSequenceNumbersFor(FILE_A.location())).hasSize(2);
+
+    DuplicateRegistrationRepair pending = repair();
+    pending.keepDataFile(FILE_A.location(), survivorSeq);
+    pending.apply(table.ops().refresh(), table.currentSnapshot());
+
+    // Stand in for several upsert checkpoints landing under the pending repair: each adds data
+    // AND an equality delete, exactly as upsert mode does for every row.
+    table.newRowDelta().addRows(FILE_B).addDeletes(FILE_B_DELETES).commit();
+    table.newRowDelta().addRows(FILE_C).addDeletes(FILE_C2_DELETES).commit();
+    table.newRowDelta().addRows(FILE_D).commit();
+
+    pending.commit();
+    table.refresh();
+
+    assertThat(liveSequenceNumbersFor(FILE_A.location()))
+        .as("Repeated concurrent upsert commits must not starve or fail the repair")
+        .containsExactly(survivorSeq);
+    assertThat(liveSequenceNumbersFor(FILE_B.location())).hasSize(1);
+    assertThat(liveSequenceNumbersFor(FILE_C.location())).hasSize(1);
+    assertThat(liveSequenceNumbersFor(FILE_D.location()))
+        .as("Every upsert's data file must survive the repair commit")
+        .hasSize(1);
+    assertThat(liveSequenceNumbersFor(FILE_B_DELETES.location()))
+        .as("Every upsert's equality delete must survive the repair commit")
+        .hasSize(1);
+  }
+
+  @TestTemplate
   public void testOperationIsReportedAsDelete() {
     table.newAppend().appendFile(FILE_A).commit();
     long seq = table.currentSnapshot().sequenceNumber();
