@@ -2436,8 +2436,7 @@ public class TestRewriteDataFilesAction extends TestBase {
 
     int snapshotsBeforeRepair = Iterables.size(table.snapshots());
 
-    RewriteDataFilesSparkAction rewrite = basicRewrite(table).binPack();
-    rewrite.validateAndInitOptions();
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table);
     assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
 
     assertThat(distinctLiveSequenceNumbersForPath(table, first.location().toString()))
@@ -2473,8 +2472,7 @@ public class TestRewriteDataFilesAction extends TestBase {
             distinctLiveSequenceNumbersForPath(table, duplicatedDeleteFile.location().toString()))
         .isEqualTo(2);
 
-    RewriteDataFilesSparkAction rewrite = basicRewrite(table).binPack();
-    rewrite.validateAndInitOptions();
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table);
     assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
 
     assertThat(distinctLiveSequenceNumbersForPath(table, duplicatedDataFile.location().toString()))
@@ -2501,8 +2499,7 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertThat(distinctLiveSequenceNumbersForPath(table, existing.location().toString()))
         .isEqualTo(3);
 
-    RewriteDataFilesSparkAction rewrite = basicRewrite(table).binPack();
-    rewrite.validateAndInitOptions();
+    RewriteDataFilesSparkAction rewrite = basicRewrite(table);
     assertThatNoException().isThrownBy(rewrite::validateNoDuplicateFileRegistrations);
 
     assertThat(distinctLiveSequenceNumbersForPath(table, existing.location().toString()))
@@ -2553,13 +2550,31 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertThat(existing).isNotNull();
     table.newAppend().appendFile(existing).commit();
 
-    // Explicit opt-out must still run, so an operator can compact deliberately.
-    assertThatNoException()
-        .isThrownBy(
-            () ->
-                basicRewrite(table)
-                    .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
-                    .execute());
+    // AFFIRM: found via a real Thor build+test run. The opt-out disables THIS guard, but on
+    // formatVersion >= 3 it does not actually let an operator "accept the risk and proceed" --
+    // rewrite_data_files still fails, just via Iceberg 1.11's own unrelated-looking
+    // SnapshotProducer added-records-vs-replaced-records sanity check (SnapshotProducer.java,
+    // "Invalid REPLACE operation"), which this exact corruption pattern happens to trip on V3+
+    // (the compactor reads the duplicated row twice and writes out more records than it
+    // "replaced"). formatVersion 2 has no such check and the compaction genuinely proceeds,
+    // silently reproducing the incident this whole guard exists to prevent -- that gap is
+    // exactly why this guard defaults to on rather than relying on this opt-out as a safety net.
+    if (formatVersion >= 3) {
+      assertThatThrownBy(
+              () ->
+                  basicRewrite(table)
+                      .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
+                      .execute())
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("Invalid REPLACE operation");
+    } else {
+      assertThatNoException()
+          .isThrownBy(
+              () ->
+                  basicRewrite(table)
+                      .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
+                      .execute());
+    }
   }
 
   @TestTemplate
