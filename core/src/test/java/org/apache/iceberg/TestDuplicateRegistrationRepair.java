@@ -42,6 +42,18 @@ import org.junit.jupiter.api.extension.ExtendWith;
 @ExtendWith(ParameterizedTestExtension.class)
 public class TestDuplicateRegistrationRepair extends TestBase {
 
+  /**
+   * AFFIRM: the defect this class repairs cannot exist in format version 1 -- V1 has no data
+   * sequence numbers at all (every entry reads back as 0), so "the same path live at two
+   * DIFFERENT sequence numbers" is not a representable state there. Any test that constructs
+   * that state must skip V1 rather than assert on it.
+   */
+  private void assumeSequenceNumbersExist() {
+    assumeThat(formatVersion)
+        .as("Format version 1 has no data sequence numbers, so this defect cannot occur")
+        .isGreaterThanOrEqualTo(2);
+  }
+
   private DuplicateRegistrationRepair repair() {
     return new DuplicateRegistrationRepair(table.name(), table.ops());
   }
@@ -131,6 +143,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testDropsHigherRegistrationAndKeepsDesignatedSurvivor() {
+    assumeSequenceNumbersExist();
     table.newAppend().appendFile(FILE_A).commit();
     long firstSeq = table.currentSnapshot().sequenceNumber();
 
@@ -153,6 +166,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testKeepingTheHigherSequenceNumberIsPossibleButWrong() {
+    assumeSequenceNumbersExist();
     // Documents that this primitive does NOT enforce the lowest-sequence-number invariant -- the
     // caller does (RewriteDataFiles/DuplicateFileRegistrationGuard, via min(sequence_number)).
     // Pinning that here so a future change that starts silently "correcting" the caller's choice
@@ -173,6 +187,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testCollapsesThreeRegistrationsToOne() {
+    assumeSequenceNumbersExist();
     table.newAppend().appendFile(FILE_A).commit();
     long firstSeq = table.currentSnapshot().sequenceNumber();
     table.newAppend().appendFile(FILE_A).commit();
@@ -190,6 +205,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testLeavesUnrelatedPathsAlone() {
+    assumeSequenceNumbersExist();
     table.newAppend().appendFile(FILE_A).appendFile(FILE_B).commit();
     long firstSeq = table.currentSnapshot().sequenceNumber();
     table.newAppend().appendFile(FILE_A).commit();
@@ -206,6 +222,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testRepairsMultiplePathsInOneCommit() {
+    assumeSequenceNumbersExist();
     table.newAppend().appendFile(FILE_A).appendFile(FILE_B).commit();
     long firstSeq = table.currentSnapshot().sequenceNumber();
     table.newAppend().appendFile(FILE_A).commit();
@@ -283,6 +300,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testFailsWhenDesignatedSurvivorSequenceNumberDoesNotExist() {
+    assumeSequenceNumbersExist();
     table.newAppend().appendFile(FILE_A).commit();
     long realSeq = table.currentSnapshot().sequenceNumber();
     table.newAppend().appendFile(FILE_A).commit();
@@ -319,6 +337,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testFailsWholeBatchWhenAnySurvivorIsMissing() {
+    assumeSequenceNumbersExist();
     // Documents the accepted batch-atomicity tradeoff raised in review: one bad path fails the
     // entire batch rather than repairing the still-valid paths and skipping the bad one. If this
     // ever changes to partial repair, this test must be the thing that forces the discussion.
@@ -345,6 +364,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testSurvivorTrackingIsNotDefeatedByAnOverlappingDelete() {
+    assumeSequenceNumbersExist();
     // Ray's short-circuit landmine: isDuplicateRegistrationToDrop records the survivor as a side
     // effect, and it used to be called inline in a || chain. A caller that ALSO issues an
     // ordinary delete() naming the same path would short-circuit that call away, leaving the
@@ -373,6 +393,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testRepairIsRetriedSuccessfullyAfterAConcurrentUnrelatedCommit() {
+    assumeSequenceNumbersExist();
     // A concurrent commit that does NOT touch the duplicated path must not block the repair --
     // it should lose the CAS, re-run validate()/apply() against the refreshed base, and succeed.
     table.newAppend().appendFile(FILE_A).commit();
@@ -444,6 +465,7 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   @TestTemplate
   public void testOperationIsReportedAsDelete() {
+    assumeSequenceNumbersExist();
     table.newAppend().appendFile(FILE_A).commit();
     long seq = table.currentSnapshot().sequenceNumber();
     table.newAppend().appendFile(FILE_A).commit();

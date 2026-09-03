@@ -500,13 +500,29 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
         .containsExactlyInAnyOrder(fileBDeletes.location(), fileB2Deletes.location());
 
     List<Tuple2<Long, String>> actualAfter = liveEntries();
+    // AFFIRM: expectations changed by the duplicate-file-registration guard, deliberately.
+    //
+    // Note what this test's own setup does above: it appends FILE_A and FILE_C at sequence 1,
+    // then `addRows(FILE_A).addRows(FILE_C)` AGAIN at sequence 2. That leaves each of those two
+    // paths live at two different data sequence numbers -- which is precisely the corrupt state
+    // that caused the production incident this guard exists for, used here (upstream) merely as
+    // a convenient fixture for producing dangling DVs.
+    //
+    // RemoveDanglingDeletesSparkAction now detects and repairs that before doing its own work,
+    // because its dangling-delete removal keys delete-file identity on
+    // (location, contentOffset, contentSizeInBytes) -- identical across both registrations of
+    // one physical file -- so operating on such a table can drop a sibling registration that
+    // still legitimately covers live data. After the repair, only the lowest registration of
+    // FILE_A and FILE_C survives, so the sequence-2 duplicates are correctly absent below.
+    //
+    // The action's actual contract under test here is unchanged and still asserted above: the
+    // two dangling FILE_B DVs are the delete files removed. That this fixture happened to be
+    // built on a duplicate registration is incidental to what it was written to verify.
     List<Tuple2<Long, String>> expectedAfter =
         ImmutableList.of(
             Tuple2.apply(1L, FILE_A.location()),
             Tuple2.apply(1L, FILE_C.location()),
             Tuple2.apply(1L, FILE_D.location()),
-            Tuple2.apply(2L, FILE_A.location()),
-            Tuple2.apply(2L, FILE_C.location()),
             Tuple2.apply(2L, fileADeletes.location()));
     assertThat(actualAfter).containsExactlyInAnyOrderElementsOf(expectedAfter);
   }

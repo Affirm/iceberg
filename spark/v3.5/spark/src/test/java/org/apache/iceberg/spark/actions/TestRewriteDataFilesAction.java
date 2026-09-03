@@ -2550,31 +2550,26 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertThat(existing).isNotNull();
     table.newAppend().appendFile(existing).commit();
 
-    // AFFIRM: found via a real Thor build+test run. The opt-out disables THIS guard, but on
-    // formatVersion >= 3 it does not actually let an operator "accept the risk and proceed" --
-    // rewrite_data_files still fails, just via Iceberg 1.11's own unrelated-looking
-    // SnapshotProducer added-records-vs-replaced-records sanity check (SnapshotProducer.java,
-    // "Invalid REPLACE operation"), which this exact corruption pattern happens to trip on V3+
-    // (the compactor reads the duplicated row twice and writes out more records than it
-    // "replaced"). formatVersion 2 has no such check and the compaction genuinely proceeds,
-    // silently reproducing the incident this whole guard exists to prevent -- that gap is
-    // exactly why this guard defaults to on rather than relying on this opt-out as a safety net.
-    if (formatVersion >= 3) {
-      assertThatThrownBy(
-              () ->
-                  basicRewrite(table)
-                      .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
-                      .execute())
-          .isInstanceOf(IllegalArgumentException.class)
-          .hasMessageContaining("Invalid REPLACE operation");
-    } else {
-      assertThatNoException()
-          .isThrownBy(
-              () ->
-                  basicRewrite(table)
-                      .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
-                      .execute());
-    }
+    // AFFIRM: found via a real Thor build+test run, and it reframes what this opt-out is for.
+    // Disabling this guard does NOT let an operator "accept the risk and proceed" on ANY format
+    // version: rewrite_data_files still fails, via Iceberg's own added-records-vs-replaced-records
+    // sanity check in SnapshotProducer.apply ("Invalid REPLACE operation: N added records > M
+    // replaced records"), which is ungated by format version and which this exact corruption
+    // pattern always trips -- the compactor reads the duplicated registration's rows twice and
+    // therefore writes out more records than it replaced.
+    //
+    // So on 1.11 a duplicate-registered table is simply not compactable. The guard's value is
+    // (a) failing early with an actionable message that names the offending paths and the
+    // remedy, instead of a cryptic arithmetic assertion from deep inside the commit, and
+    // (b) with resolve=true, actually fixing the table so compaction can proceed. That is also
+    // why this opt-out is not a useful escape hatch on its own and the guard defaults to on.
+    assertThatThrownBy(
+            () ->
+                basicRewrite(table)
+                    .option(RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS, "false")
+                    .execute())
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Invalid REPLACE operation");
   }
 
   @TestTemplate
