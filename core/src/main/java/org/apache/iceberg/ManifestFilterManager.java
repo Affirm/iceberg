@@ -82,6 +82,13 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   // live registration of that same path is a duplicate to be dropped. See
   // #dropDuplicateRegistrations for why the lowest sequence number is always the one kept.
   private final Map<String, Long> duplicateRegistrationKeepSequence = Maps.newHashMap();
+  // AFFIRM: paths from duplicateRegistrationKeepSequence actually observed live, at their
+  // designated keep-sequence-number, during the CURRENT filterManifests() pass. Manifests are
+  // processed in parallel (see filterManifests' Tasks.range(...).run(...)), so this must be
+  // thread-safe. Cleared at the start of every filterManifests() call -- see
+  // validateDuplicateRegistrationSurvivorsPresent for why a stale entry from a prior, failed
+  // commit attempt must never satisfy this check on a later retry.
+  private final Set<String> duplicateRegistrationSurvivorsSeen = Sets.newConcurrentHashSet();
   private Expression deleteExpression = Expressions.alwaysFalse();
   private long minSequenceNumber = 0;
   private boolean failAnyDelete = false;
@@ -240,13 +247,25 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
 
   // AFFIRM: true if this exact live registration (this path at this data sequence number) is a
   // duplicate that must be dropped, i.e. a *different* sequence number was chosen to survive for
-  // this same path.
+  // this same path. As a side effect, records the path as confirmed-live when THIS is the
+  // survivor entry (see duplicateRegistrationSurvivorsSeen and
+  // validateDuplicateRegistrationSurvivorsPresent for why: a commit retry against a base a
+  // concurrent writer already changed must not silently drop every registration of a path whose
+  // survivor vanished out from under it).
   private boolean isDuplicateRegistrationToDrop(F file, ManifestEntry<F> entry) {
     if (duplicateRegistrationKeepSequence.isEmpty()) {
       return false;
     }
-    Long keepSequenceNumber = duplicateRegistrationKeepSequence.get(file.location().toString());
-    return keepSequenceNumber != null && !keepSequenceNumber.equals(entry.dataSequenceNumber());
+    String path = file.location().toString();
+    Long keepSequenceNumber = duplicateRegistrationKeepSequence.get(path);
+    if (keepSequenceNumber == null) {
+      return false;
+    }
+    if (keepSequenceNumber.equals(entry.dataSequenceNumber())) {
+      duplicateRegistrationSurvivorsSeen.add(path);
+      return false;
+    }
+    return true;
   }
 
   boolean containsDeletes() {
@@ -265,8 +284,14 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * @return an array of filtered manifests
    */
   List<ManifestFile> filterManifests(Schema tableSchema, List<ManifestFile> manifests) {
+    // AFFIRM: cleared per call, not per commit attempt -- apply()/filterManifests() re-runs on
+    // every optimistic-concurrency retry against a freshly refreshed base, and a survivor seen
+    // during a PRIOR (failed/superseded) attempt must never satisfy this retry's check.
+    duplicateRegistrationSurvivorsSeen.clear();
+
     if (manifests == null || manifests.isEmpty()) {
       validateRequiredDeletes();
+      validateDuplicateRegistrationSurvivorsPresent();
       return ImmutableList.of();
     }
 
@@ -285,8 +310,47 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
             });
 
     validateRequiredDeletes(filtered);
+    validateDuplicateRegistrationSurvivorsPresent();
 
     return Arrays.asList(filtered);
+  }
+
+  /**
+   * AFFIRM: throws if the intended surviving registration for any duplicated path was not
+   * actually observed live while filtering manifests for this attempt.
+   *
+   * <p>{@code dropDuplicateRegistrations}'s keep-sequence-number map is computed once, before
+   * this repair's commit is attempted, from a scan that already happened. {@code
+   * MergingSnapshotProducer}'s optimistic-concurrency retry loop re-runs {@code validate()}/{@code
+   * apply()} -- and therefore this filtering pass -- against a freshly refreshed base on every
+   * CAS conflict, but does NOT recompute that map. If a concurrent commit changed this exact path
+   * in the narrow window between the original scan and a retry (for example, a different
+   * operation legitimately replaced the file the "keep" sequence number pointed at), silently
+   * proceeding would drop every live registration of that path -- the survivor because it no
+   * longer exists at that sequence number, and every other registration because it doesn't match
+   * either. That is silent data loss with the commit reporting success. Failing loudly here
+   * instead means the whole commit attempt aborts; a subsequent retry (or a fresh invocation of
+   * the guard) re-evaluates against the latest state rather than acting on stale intent.
+   */
+  private void validateDuplicateRegistrationSurvivorsPresent() {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return;
+    }
+
+    Set<String> missing =
+        Sets.difference(
+                duplicateRegistrationKeepSequence.keySet(), duplicateRegistrationSurvivorsSeen)
+            .immutableCopy();
+    if (!missing.isEmpty()) {
+      throw new ValidationException(
+          "Cannot repair duplicate file registrations: the intended surviving registration was "
+              + "not found live for %d path(s), most likely because a concurrent commit already "
+              + "changed them since this repair's scan. Aborting this commit attempt rather than "
+              + "risking dropping every live registration of an affected path. A retry will "
+              + "re-evaluate against the latest state. Affected: %s",
+          missing.size(),
+          COMMA.join(missing));
+    }
   }
 
   // Use the current set of referenced manifests as a source of truth when it's a subset of all

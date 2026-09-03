@@ -84,9 +84,7 @@ public class DuplicateRegistrationRepair
    * @return this for method chaining
    */
   public DuplicateRegistrationRepair keepDataFile(String path, long sequenceNumber) {
-    Preconditions.checkNotNull(path, "path cannot be null");
-    Preconditions.checkArgument(
-        sequenceNumber >= 0, "sequenceNumber must not be negative: %s", sequenceNumber);
+    checkKeepArgs(path, sequenceNumber);
     keepDataFileSequenceNumberByPath.put(path, sequenceNumber);
     return this;
   }
@@ -106,11 +104,15 @@ public class DuplicateRegistrationRepair
    * @return this for method chaining
    */
   public DuplicateRegistrationRepair keepDeleteFile(String path, long sequenceNumber) {
+    checkKeepArgs(path, sequenceNumber);
+    keepDeleteFileSequenceNumberByPath.put(path, sequenceNumber);
+    return this;
+  }
+
+  private static void checkKeepArgs(String path, long sequenceNumber) {
     Preconditions.checkNotNull(path, "path cannot be null");
     Preconditions.checkArgument(
         sequenceNumber >= 0, "sequenceNumber must not be negative: %s", sequenceNumber);
-    keepDeleteFileSequenceNumberByPath.put(path, sequenceNumber);
-    return this;
   }
 
   @Override
