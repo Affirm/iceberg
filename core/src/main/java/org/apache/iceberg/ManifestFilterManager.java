@@ -259,6 +259,61 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   // deletePaths/deleteFiles/dropPartitions) would skip this call, and skip its survivor-seen
   // side effect, even though the entry IS the survivor. See both call sites below for the
   // pattern to follow.
+  /**
+   * AFFIRM: rejects a commit that both designates a survivor for a path AND separately asks for
+   * that same path to be deleted outright.
+   *
+   * <p>Those two instructions contradict each other, and without this check the contradiction
+   * resolves silently in the destructive direction: the survivor entry is visited (so {@link
+   * #duplicateRegistrationSurvivorsSeen} records it and {@link
+   * #validateDuplicateRegistrationSurvivorsPresent} is satisfied), but is then dropped anyway by
+   * the {@code deletePaths}/{@code deleteFiles} term in the same predicate. Every live
+   * registration of the path disappears and the commit reports success -- exactly the silent-loss
+   * shape the survivor check exists to prevent, arrived at from the other direction.
+   *
+   * <p>Worth recording how this was found, because it is a genuine cost of an earlier fix. Before
+   * {@code isDuplicateRegistrationToDrop} was hoisted out of the {@code ||} chains (done so its
+   * survivor-recording side effect could not be short-circuited away), this case happened to
+   * abort loudly: {@code deletePaths} matched first, the hoisted call never ran, no survivor was
+   * recorded, and the survivor check threw. That was accidental safety, not designed safety, and
+   * hoisting removed it. This check replaces it with the real thing -- a specific error about
+   * contradictory intent, rather than a misleading "survivor not found live" message blaming
+   * concurrent modification for what is a caller bug.
+   *
+   * <p>Not covered: {@code dropPartitions}. Deciding whether a dropped partition contains a
+   * duplicated path needs the partition tuple for that path, which is only available once the
+   * manifests are open -- by which point the filtering decision has already been made. No caller
+   * combines the two today ({@link DuplicateRegistrationRepair} sets neither), and doing so would
+   * hit the silent path described above. Left as a known gap rather than a half-check.
+   */
+  private void validateNoContradictoryDuplicateRegistrationIntent() {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return;
+    }
+
+    Set<String> conflicting = Sets.newTreeSet();
+    for (String path : duplicateRegistrationKeepSequence.keySet()) {
+      if (deletePaths.contains(path)) {
+        conflicting.add(path);
+      }
+    }
+    for (F file : deleteFiles) {
+      String location = file.location().toString();
+      if (duplicateRegistrationKeepSequence.containsKey(location)) {
+        conflicting.add(location);
+      }
+    }
+
+    ValidationException.check(
+        conflicting.isEmpty(),
+        "Cannot both keep a duplicate registration and delete the same path outright: %s. "
+            + "These instructions contradict each other -- the designated survivor would be "
+            + "dropped by the explicit delete, leaving no live registration of the path at all. "
+            + "Issue the repair and the delete as separate commits if both are genuinely "
+            + "intended.",
+        COMMA.join(conflicting));
+  }
+
   private boolean isDuplicateRegistrationToDrop(F file, ManifestEntry<F> entry) {
     if (duplicateRegistrationKeepSequence.isEmpty()) {
       return false;
@@ -295,6 +350,11 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
     // every optimistic-concurrency retry against a freshly refreshed base, and a survivor seen
     // during a PRIOR (failed/superseded) attempt must never satisfy this retry's check.
     duplicateRegistrationSurvivorsSeen.clear();
+
+    // AFFIRM: must run BEFORE the filtering loop below, which itself adds entries to
+    // deleteFiles (see filterManifestWithDeletedFiles); at this point deleteFiles still holds
+    // only what the caller supplied.
+    validateNoContradictoryDuplicateRegistrationIntent();
 
     if (manifests == null || manifests.isEmpty()) {
       validateRequiredDeletes();
@@ -730,11 +790,25 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
                       F fileCopy = file.copyWithoutStats();
                       if (!isDuplicateRegistrationDrop) {
                         // AFFIRM: skip for a duplicate-registration drop -- the path itself is
-                        // not gone, a sibling entry at a different sequence number still lives
-                        // at this exact location. filesToBeDeleted() below feeds
-                        // DeleteFileFilterManager#removeDanglingDeletesFor; adding this path
-                        // there would make it drop a DV that still legitimately covers the
-                        // surviving entry, reproducing this same class of defect.
+                        // NOT gone, a sibling entry at a different sequence number still lives
+                        // at this exact location. deleteFiles has two consumers and adding the
+                        // path here would corrupt both:
+                        //
+                        //  1. filesToBeDeleted() feeds
+                        //     DeleteFileFilterManager#removeDanglingDeletesFor, which would then
+                        //     drop a DV that still legitimately covers the surviving entry --
+                        //     reproducing this same class of defect.
+                        //  2. validateRequiredDeletes() asserts
+                        //     deletedFiles.containsAll(deleteFiles) when failMissingDeletePaths
+                        //     is set. Since deleteFiles/DeleteFileSet key identity on
+                        //     (location, contentOffset, contentSizeInBytes) -- identical across
+                        //     both registrations of one physical file -- an entry added here
+                        //     also changes what that assertion demands.
+                        //
+                        // Note this runs during the filtering loop, i.e. AFTER
+                        // validateNoContradictoryDuplicateRegistrationIntent() has already read
+                        // deleteFiles; that check deliberately runs before this loop so it sees
+                        // only caller-supplied entries, not ones synthesised here.
                         deleteFiles.add(fileCopy);
                       }
 

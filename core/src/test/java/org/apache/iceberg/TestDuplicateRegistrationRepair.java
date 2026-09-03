@@ -392,6 +392,84 @@ public class TestDuplicateRegistrationRepair extends TestBase {
   }
 
   @TestTemplate
+  public void testRejectsKeepingAndDeletingTheSamePathByPath() {
+    assumeSequenceNumbersExist();
+    // Contradictory intent: designate a survivor for X, and also delete X outright. Without an
+    // explicit check this resolves SILENTLY in the destructive direction -- the survivor entry is
+    // visited (so it is recorded as seen, satisfying the survivor check) and then dropped anyway
+    // by the deletePaths term in the same predicate, leaving zero live registrations while the
+    // commit reports success.
+    //
+    // Note this case USED to abort by accident: before isDuplicateRegistrationToDrop was hoisted
+    // out of the || chain, deletePaths matched first, the hoisted call never ran, nothing was
+    // recorded, and the survivor check threw. Hoisting was correct for its own reason but removed
+    // that accidental safety, so the protection is now explicit -- and asserted here.
+    table.newAppend().appendFile(FILE_A).commit();
+    long firstSeq = table.currentSnapshot().sequenceNumber();
+    table.newAppend().appendFile(FILE_A).commit();
+    assertThat(liveSequenceNumbersFor(FILE_A.location())).hasSize(2);
+
+    DuplicateRegistrationRepair contradictory = repair();
+    contradictory.keepDataFile(FILE_A.location(), firstSeq);
+    contradictory.delete(FILE_A.location());
+
+    assertThatThrownBy(contradictory::commit)
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("Cannot both keep a duplicate registration and delete the same path")
+        .hasMessageContaining(FILE_A.location());
+
+    table.refresh();
+    assertThat(liveSequenceNumbersFor(FILE_A.location()))
+        .as("Rejected commit must leave every registration intact, not partially applied")
+        .hasSize(2);
+  }
+
+  @TestTemplate
+  public void testRejectsKeepingAndDeletingTheSamePathByFile() {
+    assumeSequenceNumbersExist();
+    // Same contradiction reached through delete(DataFile) rather than delete(CharSequence) --
+    // that populates deleteFiles instead of deletePaths, a separate term in the same predicate,
+    // so it needs its own coverage.
+    table.newAppend().appendFile(FILE_A).commit();
+    long firstSeq = table.currentSnapshot().sequenceNumber();
+    table.newAppend().appendFile(FILE_A).commit();
+
+    DuplicateRegistrationRepair contradictory = repair();
+    contradictory.keepDataFile(FILE_A.location(), firstSeq);
+    contradictory.delete(FILE_A);
+
+    assertThatThrownBy(contradictory::commit)
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("Cannot both keep a duplicate registration and delete the same path")
+        .hasMessageContaining(FILE_A.location());
+
+    table.refresh();
+    assertThat(liveSequenceNumbersFor(FILE_A.location())).hasSize(2);
+  }
+
+  @TestTemplate
+  public void testDeletingAnUnrelatedPathIsNotTreatedAsContradictory() {
+    assumeSequenceNumbersExist();
+    // Guards against the check being too aggressive: repairing X while deleting a DIFFERENT
+    // path Y is legitimate and must still commit. (Also covered by
+    // testSurvivorTrackingIsNotDefeatedByAnOverlappingDelete; asserted here explicitly so a
+    // future tightening of the contradiction check has to justify breaking it.)
+    table.newAppend().appendFile(FILE_A).appendFile(FILE_B).commit();
+    long firstSeq = table.currentSnapshot().sequenceNumber();
+    table.newAppend().appendFile(FILE_A).commit();
+
+    DuplicateRegistrationRepair mixed = repair();
+    mixed.keepDataFile(FILE_A.location(), firstSeq);
+    mixed.delete(FILE_B.location());
+
+    mixed.commit();
+    table.refresh();
+
+    assertThat(liveSequenceNumbersFor(FILE_A.location())).containsExactly(firstSeq);
+    assertThat(liveSequenceNumbersFor(FILE_B.location())).isEmpty();
+  }
+
+  @TestTemplate
   public void testRepairIsRetriedSuccessfullyAfterAConcurrentUnrelatedCommit() {
     assumeSequenceNumbersExist();
     // A concurrent commit that does NOT touch the duplicated path must not block the repair --
