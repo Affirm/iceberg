@@ -73,6 +73,17 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   private final Set<String> manifestsWithDeletes = Sets.newHashSet();
   private final PartitionSet dropPartitions;
   private final CharSequenceSet deletePaths = CharSequenceSet.empty();
+  // AFFIRM: path -> the one data sequence number at that path which must survive; every other
+  // live registration of that same path is a duplicate to be dropped. See
+  // #dropDuplicateRegistrations for why the lowest sequence number is always the one kept.
+  private final Map<String, Long> duplicateRegistrationKeepSequence = Maps.newHashMap();
+  // AFFIRM: paths from duplicateRegistrationKeepSequence actually observed live, at their
+  // designated keep-sequence-number, during the CURRENT filterManifests() pass. Manifests are
+  // processed in parallel (see filterManifests' Tasks.range(...).run(...)), so this must be
+  // thread-safe. Cleared at the start of every filterManifests() call -- see
+  // validateDuplicateRegistrationSurvivorsPresent for why a stale entry from a prior, failed
+  // commit attempt must never satisfy this check on a later retry.
+  private final Set<String> duplicateRegistrationSurvivorsSeen = Sets.newConcurrentHashSet();
   private Expression deleteExpression = Expressions.alwaysFalse();
   private long minSequenceNumber = 0;
   private boolean failAnyDelete = false;
@@ -178,11 +189,74 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
     deletePaths.add(path);
   }
 
+  /**
+   * AFFIRM: repairs a file that was registered more than once at different data sequence
+   * numbers, keeping exactly one registration per path and dropping the rest.
+   *
+   * <p>A single physical file registered twice is not something a healthy writer produces. It
+   * arises when a commit is retried after its outcome became unknown (for example {@link
+   * org.apache.iceberg.exceptions.CommitStateUnknownException}) and the retry re-registers a
+   * WriteResult that had in fact already been applied. Left alone, this corrupts the next
+   * compaction: {@code DataFileSet}/{@code DeleteFileSet} key file identity on location alone, so
+   * the data side collapses the two registrations into one manifest reference and only removes
+   * one of them, while the delete side has no sequence number to key on at all and removes both
+   * -- leaving the surviving data registration with no delete coverage and resurrecting rows that
+   * were correctly suppressed.
+   *
+   * <p>The value in {@code keepSequenceNumberByPath} for each path MUST be the lowest live data
+   * sequence number registered for that path, not an arbitrary choice. Any delete file committed
+   * between two duplicate registrations has a sequence number greater than the lower one, so it
+   * continues to cover a registration kept at the lower sequence number. Keeping the higher one
+   * instead would silently drop that coverage and reproduce the exact defect this repairs.
+   *
+   * <p>Applies uniformly regardless of content type: a duplicate registration of a delete file is
+   * exactly as dangerous to whatever later reads it as a duplicate data file registration is, so
+   * both filter managers ({@code DataFile} and {@code DeleteFile}) are driven the same way.
+   *
+   * @param keepSequenceNumberByPath a map from file location to the one live data sequence
+   *     number at that location which must be kept; every other live registration at that
+   *     location is deleted from the new snapshot
+   */
+  protected void dropDuplicateRegistrations(Map<String, Long> keepSequenceNumberByPath) {
+    Preconditions.checkNotNull(
+        keepSequenceNumberByPath, "Cannot drop duplicate registrations using: null");
+    if (keepSequenceNumberByPath.isEmpty()) {
+      return;
+    }
+    invalidateFilteredCache();
+    this.duplicateRegistrationKeepSequence.putAll(keepSequenceNumberByPath);
+    this.allDeletesReferenceManifests = false;
+  }
+
+  // AFFIRM: true if this exact live registration (this path at this data sequence number) is a
+  // duplicate that must be dropped, i.e. a *different* sequence number was chosen to survive for
+  // this same path. As a side effect, records the path as confirmed-live when THIS is the
+  // survivor entry (see duplicateRegistrationSurvivorsSeen and
+  // validateDuplicateRegistrationSurvivorsPresent for why: a commit retry against a base a
+  // concurrent writer already changed must not silently drop every registration of a path whose
+  // survivor vanished out from under it).
+  private boolean isDuplicateRegistrationToDrop(F file, ManifestEntry<F> entry) {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return false;
+    }
+    String path = file.location().toString();
+    Long keepSequenceNumber = duplicateRegistrationKeepSequence.get(path);
+    if (keepSequenceNumber == null) {
+      return false;
+    }
+    if (keepSequenceNumber.equals(entry.dataSequenceNumber())) {
+      duplicateRegistrationSurvivorsSeen.add(path);
+      return false;
+    }
+    return true;
+  }
+
   boolean containsDeletes() {
     return !deletePaths.isEmpty()
         || !deleteFiles.isEmpty()
         || deleteExpression != Expressions.alwaysFalse()
-        || !dropPartitions.isEmpty();
+        || !dropPartitions.isEmpty()
+        || !duplicateRegistrationKeepSequence.isEmpty();
   }
 
   /**
@@ -193,8 +267,14 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * @return an array of filtered manifests
    */
   List<ManifestFile> filterManifests(Schema tableSchema, List<ManifestFile> manifests) {
+    // AFFIRM: cleared per call, not per commit attempt -- apply()/filterManifests() re-runs on
+    // every optimistic-concurrency retry against a freshly refreshed base, and a survivor seen
+    // during a PRIOR (failed/superseded) attempt must never satisfy this retry's check.
+    duplicateRegistrationSurvivorsSeen.clear();
+
     if (manifests == null || manifests.isEmpty()) {
       validateRequiredDeletes();
+      validateDuplicateRegistrationSurvivorsPresent();
       return ImmutableList.of();
     }
 
@@ -213,8 +293,47 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
             });
 
     validateRequiredDeletes(filtered);
+    validateDuplicateRegistrationSurvivorsPresent();
 
     return Arrays.asList(filtered);
+  }
+
+  /**
+   * AFFIRM: throws if the intended surviving registration for any duplicated path was not
+   * actually observed live while filtering manifests for this attempt.
+   *
+   * <p>{@code dropDuplicateRegistrations}'s keep-sequence-number map is computed once, before
+   * this repair's commit is attempted, from a scan that already happened. {@code
+   * MergingSnapshotProducer}'s optimistic-concurrency retry loop re-runs {@code validate()}/{@code
+   * apply()} -- and therefore this filtering pass -- against a freshly refreshed base on every
+   * CAS conflict, but does NOT recompute that map. If a concurrent commit changed this exact path
+   * in the narrow window between the original scan and a retry (for example, a different
+   * operation legitimately replaced the file the "keep" sequence number pointed at), silently
+   * proceeding would drop every live registration of that path -- the survivor because it no
+   * longer exists at that sequence number, and every other registration because it doesn't match
+   * either. That is silent data loss with the commit reporting success. Failing loudly here
+   * instead means the whole commit attempt aborts; a subsequent retry (or a fresh invocation of
+   * the guard) re-evaluates against the latest state rather than acting on stale intent.
+   */
+  private void validateDuplicateRegistrationSurvivorsPresent() {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return;
+    }
+
+    Set<String> missing =
+        Sets.difference(
+                duplicateRegistrationKeepSequence.keySet(), duplicateRegistrationSurvivorsSeen)
+            .immutableCopy();
+    if (!missing.isEmpty()) {
+      throw new ValidationException(
+          "Cannot repair duplicate file registrations: the intended surviving registration was "
+              + "not found live for %d path(s), most likely because a concurrent commit already "
+              + "changed them since this repair's scan. Aborting this commit attempt rather than "
+              + "risking dropping every live registration of an affected path. A retry will "
+              + "re-evaluate against the latest state. Affected: %s",
+          missing.size(),
+          COMMA.join(missing));
+    }
   }
 
   // Use the current set of referenced manifests as a source of truth when it's a subset of all
@@ -400,9 +519,19 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   }
 
   private boolean canContainDroppedFiles(ManifestFile manifest) {
-    if (!deletePaths.isEmpty()) {
+    // AFFIRM: independent checks, not an else-if chain. deleteFiles/deletePaths and
+    // duplicateRegistrationKeepSequence can in principle both be populated on the same
+    // ManifestFilterManager instance (they're independent predicates on the same class); an
+    // else-if here would let a deleteFiles partition-overlap check short-circuit past a real
+    // duplicate registration in a manifest outside that partition set, silently under-scanning.
+    if (!deletePaths.isEmpty() || !duplicateRegistrationKeepSequence.isEmpty()) {
+      // AFFIRM: no cheap partition/path pre-filter is available for a duplicate registration --
+      // it can be in any manifest of either content type -- so every manifest must be opened.
+      // This repair path is rare by construction, so the extra scan cost is acceptable.
       return true;
-    } else if (!deleteFiles.isEmpty()) {
+    }
+
+    if (!deleteFiles.isEmpty()) {
       return ManifestFileUtil.canContainAny(manifest, deleteFilePartitions, specsById);
     }
 
@@ -424,6 +553,7 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
           deletePaths.contains(file.location())
               || deleteFiles.contains(file)
               || dropPartitions.contains(file.specId(), file.partition())
+              || isDuplicateRegistrationToDrop(file, entry)
               || (isDelete
                   && entry.isLive()
                   && entry.dataSequenceNumber() > 0
@@ -472,6 +602,7 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
                       deletePaths.contains(file.location())
                           || deleteFiles.contains(file)
                           || dropPartitions.contains(file.specId(), file.partition())
+                          || isDuplicateRegistrationToDrop(file, entry)
                           || (isDelete
                               && entry.isLive()
                               && entry.dataSequenceNumber() > 0

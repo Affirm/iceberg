@@ -25,6 +25,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,7 +34,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DuplicateRegistrationRepair;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.RewriteJobOrder;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
@@ -67,6 +72,7 @@ import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.StructLikeMap;
 import org.apache.iceberg.util.Tasks;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.internal.SQLConf;
 import org.slf4j.Logger;
@@ -87,7 +93,11 @@ public class RewriteDataFilesSparkAction
           USE_STARTING_SEQUENCE_NUMBER,
           REWRITE_JOB_ORDER,
           OUTPUT_SPEC_ID,
-          REMOVE_DANGLING_DELETES);
+          REMOVE_DANGLING_DELETES,
+          VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+          RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
+
+  private static final int DUPLICATE_REGISTRATION_REPORT_LIMIT = 10;
 
   private static final RewriteDataFilesSparkAction.Result EMPTY_RESULT =
       ImmutableRewriteDataFiles.Result.builder().rewriteResults(ImmutableList.of()).build();
@@ -100,6 +110,8 @@ public class RewriteDataFilesSparkAction
   private int maxFailedCommits;
   private boolean partialProgressEnabled;
   private boolean removeDanglingDeletes;
+  private boolean validateDuplicateFileRegistrations;
+  private boolean resolveDuplicateFileRegistrations;
   private boolean useStartingSequenceNumber;
   private RewriteJobOrder rewriteJobOrder;
   private FileRewriter<FileScanTask, DataFile> rewriter = null;
@@ -162,14 +174,22 @@ public class RewriteDataFilesSparkAction
       return EMPTY_RESULT;
     }
 
-    long startingSnapshotId = table.currentSnapshot().snapshotId();
-
     // Default to BinPack if no strategy selected
     if (this.rewriter == null) {
       this.rewriter = new SparkBinPackDataRewriter(spark(), table);
     }
 
     validateAndInitOptions();
+
+    if (validateDuplicateFileRegistrations) {
+      validateNoDuplicateFileRegistrations();
+    }
+
+    // AFFIRM: captured AFTER the duplicate-registration check, not before. If
+    // repairDuplicateFileRegistrations() committed a fix above, both the file-group scan below
+    // and the final rewrite commit must start from that corrected snapshot -- capturing this
+    // earlier would silently plan against the pre-repair snapshot and defeat the repair.
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
 
     StructLikeMap<List<List<FileScanTask>>> fileGroupsByPartition =
         planFileGroups(startingSnapshotId);
@@ -213,6 +233,137 @@ public class RewriteDataFilesSparkAction
     int removedCount = Iterables.size(action.execute().removedDeleteFiles());
     resultBuilder.removedDeleteFilesCount(removedCount);
     return resultBuilder.build();
+  }
+
+  /**
+   * AFFIRM: finds every live file path (data or delete) registered at more than one data
+   * sequence number and, depending on {@link #resolveDuplicateFileRegistrations}, either repairs
+   * it or fails the action.
+   *
+   * <p>Rewriting a table with a duplicate registration silently corrupts it. {@code DataFileSet}
+   * and {@code DeleteFileSet} both key file identity on location alone, and a file's data
+   * sequence number lives on the manifest entry rather than on the {@code ContentFile}, so the
+   * two registrations cannot be told apart. The data side removes one of the two, because the
+   * collapsed {@code DataFile} carries a single {@code manifestLocation()} and the other
+   * manifest is never opened. The delete side removes both, because {@code SparkContentFile}
+   * does not override {@code manifestLocation()} and every manifest is therefore filtered. The
+   * surviving data registration is left with no delete file covering it, and rows that were
+   * correctly suppressed become visible.
+   *
+   * <p>Costs one scan of the entries metadata table, projecting three columns.
+   */
+  @VisibleForTesting
+  void validateNoDuplicateFileRegistrations() {
+    List<Row> duplicates = findDuplicateFileRegistrations();
+
+    if (duplicates.isEmpty()) {
+      return;
+    }
+
+    if (resolveDuplicateFileRegistrations) {
+      repairDuplicateFileRegistrations(duplicates);
+      return;
+    }
+
+    boolean truncated = duplicates.size() > DUPLICATE_REGISTRATION_REPORT_LIMIT;
+    String sample =
+        duplicates.stream()
+            .limit(DUPLICATE_REGISTRATION_REPORT_LIMIT)
+            .map(
+                row -> {
+                  String path = row.getAs("file_path");
+                  long distinctSequenceNumbers = row.getAs("distinct_sequence_numbers");
+                  return String.format("%s (%d sequence numbers)", path, distinctSequenceNumbers);
+                })
+            .collect(Collectors.joining(", "));
+
+    throw new ValidationException(
+        "Cannot rewrite %s: %d file path(s) (data or delete) are registered at more than one "
+            + "data sequence number. Compaction cannot handle that safely and would turn it into "
+            + "duplicate rows. This usually follows a commit retried after its outcome became "
+            + "unknown. Affected (showing up to %d): %s%s. Resolve the duplicate registrations "
+            + "first, set %s=true to repair automatically, or set %s=false to proceed anyway and "
+            + "accept the risk.",
+        table.name(),
+        duplicates.size(),
+        DUPLICATE_REGISTRATION_REPORT_LIMIT,
+        sample,
+        truncated ? ", ..." : "",
+        RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
+        VALIDATE_DUPLICATE_FILE_REGISTRATIONS);
+  }
+
+  /**
+   * AFFIRM: returns one row per live file path (data or delete) that is registered at more than
+   * one distinct live data sequence number, with columns {@code file_path}, {@code content}
+   * (the lowest live registration's content type -- content does not vary across duplicate
+   * registrations of the same physical file), {@code keep_sequence_number} (the lowest live data
+   * sequence number registered for that path), and {@code distinct_sequence_numbers} (how many
+   * distinct sequence numbers that path is live at). Empty if the table has no such path.
+   */
+  private List<Row> findDuplicateFileRegistrations() {
+    String tempView =
+        "affirm_duplicate_registrations_" + UUID.randomUUID().toString().replace("-", "");
+    loadMetadataTable(table, MetadataTableType.ENTRIES)
+        .filter("status < 2") // live entries only; status 2 is DELETED
+        .selectExpr(
+            "data_file.file_path as file_path", "data_file.content as content", "sequence_number")
+        .distinct()
+        .createOrReplaceTempView(tempView);
+    try {
+      return spark()
+          .sql(
+              String.format(
+                  "SELECT file_path, min(content) as content, "
+                      + "min(sequence_number) as keep_sequence_number, "
+                      + "count(distinct sequence_number) as distinct_sequence_numbers "
+                      + "FROM %s GROUP BY file_path "
+                      + "HAVING count(distinct sequence_number) > 1",
+                  tempView))
+          .collectAsList();
+    } finally {
+      spark().catalog().dropTempView(tempView);
+    }
+  }
+
+  /**
+   * AFFIRM: repairs every duplicated file path found by {@link #findDuplicateFileRegistrations()}
+   * in a single commit, then refreshes {@code table} so the caller plans the rewrite against the
+   * corrected metadata.
+   *
+   * <p>For each path, keeps the lowest live data sequence number and drops every other live
+   * registration of that path. This is metadata-only: no physical file is touched, and the
+   * underlying file is never at risk of being treated as orphaned, because the kept registration
+   * still references its exact location. See {@link DuplicateRegistrationRepair} for why the
+   * lowest sequence number, specifically, must be the one kept.
+   */
+  private void repairDuplicateFileRegistrations(List<Row> duplicates) {
+    DuplicateRegistrationRepair repair =
+        new DuplicateRegistrationRepair(table.name(), ((HasTableOperations) table).operations());
+
+    for (Row row : duplicates) {
+      String path = row.getAs("file_path");
+      int content = row.getAs("content");
+      long keepSequenceNumber = row.getAs("keep_sequence_number");
+      if (content == FileContent.DATA.id()) {
+        repair.keepDataFile(path, keepSequenceNumber);
+      } else {
+        // FileContent.POSITION_DELETES or FileContent.EQUALITY_DELETES
+        repair.keepDeleteFile(path, keepSequenceNumber);
+      }
+    }
+
+    repair.commit();
+    table.refresh();
+
+    LOG.warn(
+        "Repaired {} duplicate file registration(s) in {} before compaction: kept the lowest "
+            + "live data sequence number for each path and dropped every other live "
+            + "registration. This usually follows a commit retried after its outcome became "
+            + "unknown. Set {}=false to require manual remediation instead of automatic repair.",
+        duplicates.size(),
+        table.name(),
+        RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
   }
 
   StructLikeMap<List<List<FileScanTask>>> planFileGroups(long startingSnapshotId) {
@@ -492,6 +643,18 @@ public class RewriteDataFilesSparkAction
     removeDanglingDeletes =
         PropertyUtil.propertyAsBoolean(
             options(), REMOVE_DANGLING_DELETES, REMOVE_DANGLING_DELETES_DEFAULT);
+
+    validateDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
+
+    resolveDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
 
     rewriteJobOrder =
         RewriteJobOrder.fromName(
