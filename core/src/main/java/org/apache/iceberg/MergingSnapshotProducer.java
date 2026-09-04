@@ -203,10 +203,10 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
   }
 
   /**
-   * AFFIRM: repairs duplicate file registrations, keeping exactly one live registration per
-   * path and dropping the rest. See {@link ManifestFilterManager#dropDuplicateRegistrations} for
-   * why the lowest data sequence number per path must always be the one kept, for both data and
-   * delete files independently.
+   * AFFIRM: repairs duplicate file registrations, keeping exactly one live registration per path
+   * and dropping the rest. See {@link ManifestFilterManager#dropDuplicateRegistrations} for why the
+   * lowest data sequence number per path must always be the one kept, for both data and delete
+   * files independently.
    *
    * @param keepDataFileSequenceNumberByPath path -> data sequence number to keep, for data files
    * @param keepDeleteFileSequenceNumberByPath path -> data sequence number to keep, for delete

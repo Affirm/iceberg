@@ -217,18 +217,18 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   }
 
   /**
-   * AFFIRM: repairs a file that was registered more than once at different data sequence
-   * numbers, keeping exactly one registration per path and dropping the rest.
+   * AFFIRM: repairs a file that was registered more than once at different data sequence numbers,
+   * keeping exactly one registration per path and dropping the rest.
    *
    * <p>A single physical file registered twice is not something a healthy writer produces. It
    * arises when a commit is retried after its outcome became unknown (for example {@link
    * org.apache.iceberg.exceptions.CommitStateUnknownException}) and the retry re-registers a
    * WriteResult that had in fact already been applied. Left alone, this corrupts the next
    * compaction: {@code DataFileSet}/{@code DeleteFileSet} key file identity on location alone, so
-   * the data side collapses the two registrations into one manifest reference and only removes
-   * one of them, while the delete side has no sequence number to key on at all and removes both
-   * -- leaving the surviving data registration with no delete coverage and resurrecting rows that
-   * were correctly suppressed.
+   * the data side collapses the two registrations into one manifest reference and only removes one
+   * of them, while the delete side has no sequence number to key on at all and removes both --
+   * leaving the surviving data registration with no delete coverage and resurrecting rows that were
+   * correctly suppressed.
    *
    * <p>The value in {@code keepSequenceNumberByPath} for each path MUST be the lowest live data
    * sequence number registered for that path, not an arbitrary choice. Any delete file committed
@@ -240,9 +240,9 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * exactly as dangerous to whatever later reads it as a duplicate data file registration is, so
    * both filter managers ({@code DataFile} and {@code DeleteFile}) are driven the same way.
    *
-   * @param keepSequenceNumberByPath a map from file location to the one live data sequence
-   *     number at that location which must be kept; every other live registration at that
-   *     location is deleted from the new snapshot
+   * @param keepSequenceNumberByPath a map from file location to the one live data sequence number
+   *     at that location which must be kept; every other live registration at that location is
+   *     deleted from the new snapshot
    */
   protected void dropDuplicateRegistrations(Map<String, Long> keepSequenceNumberByPath) {
     Preconditions.checkNotNull(
@@ -277,14 +277,14 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * resolves silently in the destructive direction: the survivor entry is visited (so {@link
    * #duplicateRegistrationSurvivorsSeen} records it and {@link
    * #validateDuplicateRegistrationSurvivorsPresent} is satisfied), but is then dropped anyway by
-   * the {@code deletePaths}/{@code deleteFiles} term in the same predicate. Every live
-   * registration of the path disappears and the commit reports success -- exactly the silent-loss
-   * shape the survivor check exists to prevent, arrived at from the other direction.
+   * the {@code deletePaths}/{@code deleteFiles} term in the same predicate. Every live registration
+   * of the path disappears and the commit reports success -- exactly the silent-loss shape the
+   * survivor check exists to prevent, arrived at from the other direction.
    *
    * <p>Worth recording how this was found, because it is a genuine cost of an earlier fix. Before
    * {@code isDuplicateRegistrationToDrop} was hoisted out of the {@code ||} chains (done so its
-   * survivor-recording side effect could not be short-circuited away), this case happened to
-   * abort loudly: {@code deletePaths} matched first, the hoisted call never ran, no survivor was
+   * survivor-recording side effect could not be short-circuited away), this case happened to abort
+   * loudly: {@code deletePaths} matched first, the hoisted call never ran, no survivor was
    * recorded, and the survivor check threw. That was accidental safety, not designed safety, and
    * hoisting removed it. This check replaces it with the real thing -- a specific error about
    * contradictory intent, rather than a misleading "survivor not found live" message blaming
@@ -397,70 +397,69 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   }
 
   /**
-   * AFFIRM: throws if the intended surviving registration for any duplicated path was not
-   * actually observed live while filtering manifests for this attempt.
+   * AFFIRM: throws if the intended surviving registration for any duplicated path was not actually
+   * observed live while filtering manifests for this attempt.
    *
-   * <p>{@code dropDuplicateRegistrations}'s keep-sequence-number map is computed once, before
-   * this repair's commit is attempted, from a scan that already happened. {@code
+   * <p>{@code dropDuplicateRegistrations}'s keep-sequence-number map is computed once, before this
+   * repair's commit is attempted, from a scan that already happened. {@code
    * MergingSnapshotProducer}'s optimistic-concurrency retry loop re-runs {@code validate()}/{@code
-   * apply()} -- and therefore this filtering pass -- against a freshly refreshed base on every
-   * CAS conflict, but does NOT recompute that map. If a concurrent commit changed this exact path
-   * in the narrow window between the original scan and a retry (for example, a different
-   * operation legitimately replaced the file the "keep" sequence number pointed at), silently
-   * proceeding would drop every live registration of that path -- the survivor because it no
-   * longer exists at that sequence number, and every other registration because it doesn't match
-   * either. That is silent data loss with the commit reporting success. Failing loudly here
-   * instead means the whole commit attempt aborts; a subsequent retry (or a fresh invocation of
-   * the guard) re-evaluates against the latest state rather than acting on stale intent.
+   * apply()} -- and therefore this filtering pass -- against a freshly refreshed base on every CAS
+   * conflict, but does NOT recompute that map. If a concurrent commit changed this exact path in
+   * the narrow window between the original scan and a retry (for example, a different operation
+   * legitimately replaced the file the "keep" sequence number pointed at), silently proceeding
+   * would drop every live registration of that path -- the survivor because it no longer exists at
+   * that sequence number, and every other registration because it doesn't match either. That is
+   * silent data loss with the commit reporting success. Failing loudly here instead means the whole
+   * commit attempt aborts; a subsequent retry (or a fresh invocation of the guard) re-evaluates
+   * against the latest state rather than acting on stale intent.
    *
-   * <p><b>What does NOT trigger this: a concurrent streaming writer, however frequent --
-   * including an UPSERT writer.</b> This matters because our CDC tables are fed by a Flink upsert
-   * sink that commits every ~5 minutes and emits an equality delete for every row, so "every
-   * commit touches the delete side" is the steady state here, not an edge case. It is still safe,
-   * and the reason is structural rather than a property of appends:
+   * <p><b>What does NOT trigger this: a concurrent streaming writer, however frequent -- including
+   * an UPSERT writer.</b> This matters because our CDC tables are fed by a Flink upsert sink that
+   * commits every ~5 minutes and emits an equality delete for every row, so "every commit touches
+   * the delete side" is the steady state here, not an edge case. It is still safe, and the reason
+   * is structural rather than a property of appends:
    *
    * <ul>
    *   <li>An upsert commits a {@code RowDelta} that only calls {@code addRows}/{@code addDeletes}
    *       -- never {@code removeRows}/{@code removeDeletes}. So {@code deletePaths}, {@code
    *       deleteFiles} and {@code dropPartitions} all stay EMPTY on that commit.
    *   <li>With all three empty and no delete expression, {@code canContainDeletedFiles} returns
-   *       false for every pre-existing manifest, so those manifests are never opened or
-   *       rewritten and no existing entry can be marked DELETED. Note that {@code
-   *       canContainDeletedFiles} has no {@code minSequenceNumber} term -- which is also why
-   *       ordinary writer commits never clean up dangling equality deletes, i.e. the very reason
-   *       they accumulate on these tables. That accumulation is empirical confirmation of this
-   *       reading.
-   *   <li>Even when a commit does merge manifests, {@link ManifestWriter#existing} is
-   *       contractually required to preserve the original data sequence number, so a survivor
-   *       stays findable at exactly the sequence number the scan designated.
+   *       false for every pre-existing manifest, so those manifests are never opened or rewritten
+   *       and no existing entry can be marked DELETED. Note that {@code canContainDeletedFiles} has
+   *       no {@code minSequenceNumber} term -- which is also why ordinary writer commits never
+   *       clean up dangling equality deletes, i.e. the very reason they accumulate on these tables.
+   *       That accumulation is empirical confirmation of this reading.
+   *   <li>Even when a commit does merge manifests, {@link ManifestWriter#existing} is contractually
+   *       required to preserve the original data sequence number, so a survivor stays findable at
+   *       exactly the sequence number the scan designated.
    * </ul>
    *
-   * <p>Nor does a long-running compaction widen the window: the repair is a separate
-   * metadata-only commit that lands BEFORE the rewrite is planned, so the rewrite's own duration
-   * is irrelevant here. Ordinary CAS contention on the rewrite's own commit is a separate,
-   * pre-existing concern that {@code partial-progress.enabled} addresses. The repair does add one
-   * more commit competing with the writer, but it is metadata-only, fast, and inherits the
-   * table's normal {@code commit.retry.*} budget.
+   * <p>Nor does a long-running compaction widen the window: the repair is a separate metadata-only
+   * commit that lands BEFORE the rewrite is planned, so the rewrite's own duration is irrelevant
+   * here. Ordinary CAS contention on the rewrite's own commit is a separate, pre-existing concern
+   * that {@code partial-progress.enabled} addresses. The repair does add one more commit competing
+   * with the writer, but it is metadata-only, fast, and inherits the table's normal {@code
+   * commit.retry.*} budget.
    *
    * <p>Only an operation that explicitly removes or replaces that exact entry can trigger this:
-   * another compaction, a DELETE/MERGE/overwrite touching that file, a dedup or privacy-delete
-   * job, or another repair. None of those run on the streaming writer's cadence.
+   * another compaction, a DELETE/MERGE/overwrite touching that file, a dedup or privacy-delete job,
+   * or another repair. None of those run on the streaming writer's cadence.
    *
    * <p><b>Known, accepted tradeoff (raised in review on Affirm/iceberg#6,
-   * pullrequestreview-5105776910):</b> this fails the ENTIRE batch's commit if even one
-   * duplicated path's survivor goes missing, even when every other path in the batch is still
-   * perfectly repairable. Deliberately not implemented as "drop the poisoned path and repair the
-   * rest": that would mean silently mutating repair intent baked into an EARLIER scan under
-   * exactly the CAS-conflict conditions this method exists to be paranoid about, which is a much
-   * larger correctness surface than the fail-and-let-a-fresh-run-rescan behavior chosen here.
+   * pullrequestreview-5105776910):</b> this fails the ENTIRE batch's commit if even one duplicated
+   * path's survivor goes missing, even when every other path in the batch is still perfectly
+   * repairable. Deliberately not implemented as "drop the poisoned path and repair the rest": that
+   * would mean silently mutating repair intent baked into an EARLIER scan under exactly the
+   * CAS-conflict conditions this method exists to be paranoid about, which is a much larger
+   * correctness surface than the fail-and-let-a-fresh-run-rescan behavior chosen here.
    *
-   * <p>The whole-batch failure is safe, and self-healing PROVIDED the interfering operation is
-   * not itself recurring: the next scheduled compaction run re-scans and repairs whatever is
-   * still actually duplicated. If some job repeatedly removes the same survivor on a cadence
-   * shorter than the repair takes to commit, repair would keep failing and the table would stay
-   * duplicated -- detectable as the same table failing this check run after run, which is the
-   * signal the follow-up repair-frequency metric should alert on. Revisit the partial-repair
-   * design only if that is actually observed, not preemptively.
+   * <p>The whole-batch failure is safe, and self-healing PROVIDED the interfering operation is not
+   * itself recurring: the next scheduled compaction run re-scans and repairs whatever is still
+   * actually duplicated. If some job repeatedly removes the same survivor on a cadence shorter than
+   * the repair takes to commit, repair would keep failing and the table would stay duplicated --
+   * detectable as the same table failing this check run after run, which is the signal the
+   * follow-up repair-frequency metric should alert on. Revisit the partial-repair design only if
+   * that is actually observed, not preemptively.
    */
   private void validateDuplicateRegistrationSurvivorsPresent() {
     if (duplicateRegistrationKeepSequence.isEmpty()) {

@@ -44,9 +44,9 @@ public class TestDuplicateRegistrationRepair extends TestBase {
 
   /**
    * AFFIRM: the defect this class repairs cannot exist in format version 1 -- V1 has no data
-   * sequence numbers at all (every entry reads back as 0), so "the same path live at two
-   * DIFFERENT sequence numbers" is not a representable state there. Any test that constructs
-   * that state must skip V1 rather than assert on it.
+   * sequence numbers at all (every entry reads back as 0), so "the same path live at two DIFFERENT
+   * sequence numbers" is not a representable state there. Any test that constructs that state must
+   * skip V1 rather than assert on it.
    */
   private void assumeSequenceNumbersExist() {
     assumeThat(formatVersion)
@@ -327,7 +327,8 @@ public class TestDuplicateRegistrationRepair extends TestBase {
     table.newAppend().appendFile(FILE_A).commit();
     long seq = table.currentSnapshot().sequenceNumber();
 
-    assertThatThrownBy(() -> repair().keepDataFile("/path/to/never-registered.parquet", seq).commit())
+    assertThatThrownBy(
+            () -> repair().keepDataFile("/path/to/never-registered.parquet", seq).commit())
         .isInstanceOf(ValidationException.class)
         .hasMessageContaining("the intended surviving registration was not found live");
 
