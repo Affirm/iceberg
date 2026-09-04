@@ -65,10 +65,10 @@ public interface RewritePositionDeleteFiles
    * registered at more than one data sequence number.
    *
    * <p>Mirrors {@link RewriteDataFiles#VALIDATE_DUPLICATE_FILE_REGISTRATIONS} -- this action
-   * commits through the same {@code ManifestFilterManager} machinery and is reachable
-   * independently of {@code rewrite_data_files} (run standalone against a table, e.g. from an
-   * oncall/backfill notebook), so it needs the identical guard rather than assuming {@code
-   * rewrite_data_files} already ran first.
+   * commits through the same {@code ManifestFilterManager} machinery and is reachable independently
+   * of {@code rewrite_data_files} (run standalone against a table, e.g. from an oncall/backfill
+   * notebook), so it needs the identical guard rather than assuming {@code rewrite_data_files}
+   * already ran first.
    *
    * <p>Defaults to true.
    */
