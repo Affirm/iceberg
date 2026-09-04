@@ -58,6 +58,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.actions.BinPackRewriteFilePlanner;
 import org.apache.iceberg.actions.RewriteDataFiles;
+import org.apache.iceberg.actions.RewritePositionDeleteFiles;
 import org.apache.iceberg.actions.RewritePositionDeleteFiles.FileGroupRewriteResult;
 import org.apache.iceberg.actions.RewritePositionDeleteFiles.Result;
 import org.apache.iceberg.actions.SizeBasedFileRewritePlanner;
@@ -75,6 +76,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.CatalogTestBase;
 import org.apache.iceberg.spark.SparkCatalogConfig;
 import org.apache.iceberg.spark.SparkReadOptions;
+import org.apache.iceberg.spark.SparkTableUtil;
 import org.apache.iceberg.spark.data.TestHelpers;
 import org.apache.iceberg.spark.source.FourColumnRecord;
 import org.apache.iceberg.spark.source.ThreeColumnRecord;
@@ -855,6 +857,128 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
     // rewriting DVs via rewritePositionDeletes shouldn't be possible anymore
     assertThat(SparkActions.get(spark).rewritePositionDeletes(table).execute().rewriteResults())
         .isEmpty();
+  }
+
+  /**
+   * AFFIRM: run standalone against a duplicated delete-file registration, with no prior
+   * rewrite_data_files call on this table -- the scenario review feedback on Affirm/iceberg#6
+   * (pullrequestreview-5105776910) flagged as reachable via production oncall/backfill notebooks
+   * calling {@code CALL ...system.rewrite_position_delete_files(...)} directly.
+   */
+  @TestTemplate
+  public void testRepairsDuplicateDeleteFileRegistrationsStandalone() throws Exception {
+    Table table = createTableUnpartitioned(2, SCALE);
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table);
+    writePosDeletesForFiles(table, 2, DELETES_SCALE, dataFiles);
+
+    List<DeleteFile> deleteFiles = deleteFiles(table);
+    assertThat(deleteFiles).hasSize(2);
+    DeleteFile duplicated = deleteFiles.get(0);
+    assertThat(distinctLiveSequenceNumbersForPath(table, duplicated.location().toString()))
+        .as("Sanity check: exactly one registration before duplicating it")
+        .isEqualTo(1);
+
+    // Re-register the already-live delete file at a second data sequence number -- the same
+    // CommitStateUnknownException-retry scenario RewriteDataFilesSparkAction's guard repairs.
+    table.newRowDelta().addDeletes(duplicated).commit();
+    assertThat(distinctLiveSequenceNumbersForPath(table, duplicated.location().toString()))
+        .as("Duplicate registration must exist before repair")
+        .isEqualTo(2);
+
+    Result result =
+        SparkActions.get(spark)
+            .rewritePositionDeletes(table)
+            .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+            .execute();
+
+    // AFFIRM: do NOT assert the duplicated path still has one registration. With REWRITE_ALL the
+    // action legitimately rewrites every position delete into a new file, so the original path is
+    // expected to be gone entirely afterward -- an earlier version of this test asserted 1 and
+    // correctly observed 0. The invariant that actually matters is that NO path is left
+    // multiply-registered, which is what the repair guarantees and what the rewrite must not
+    // reintroduce.
+    assertThat(pathsWithMultipleLiveRegistrations(table))
+        .as("No path may be left registered at more than one data sequence number")
+        .isEmpty();
+    // The repair's commit precedes the rewrite, so the rewrite must proceed normally rather than
+    // being blocked by the (now repaired) duplicate.
+    assertThat(result.rewrittenDeleteFilesCount()).isGreaterThan(0);
+  }
+
+  @TestTemplate
+  public void testRejectsDuplicateDeleteFileRegistrationsStandaloneWhenResolveDisabled()
+      throws Exception {
+    Table table = createTableUnpartitioned(2, SCALE);
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table);
+    writePosDeletesForFiles(table, 2, DELETES_SCALE, dataFiles);
+
+    DeleteFile duplicated = deleteFiles(table).get(0);
+    table.newRowDelta().addDeletes(duplicated).commit();
+
+    assertThatThrownBy(
+            () ->
+                SparkActions.get(spark)
+                    .rewritePositionDeletes(table)
+                    .option(RewritePositionDeleteFiles.RESOLVE_DUPLICATE_FILE_REGISTRATIONS, "false")
+                    .execute())
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("registered at more than one data sequence number")
+        .hasMessageContaining(duplicated.location().toString());
+  }
+
+  /**
+   * AFFIRM: Iceberg 1.11 will not let you create a duplicated DV registration at all.
+   *
+   * <p>An earlier version of this file tried to drive the guard's DV-refusal branch end-to-end by
+   * migrating to V3 and re-adding a live DV. That is impossible: {@code BaseRowDelta#validate}
+   * calls {@code validateAddedDVs} unconditionally, so the second {@code addDeletes} of a DV whose
+   * referenced data file already has one is rejected with "Found concurrently added DV for
+   * file...". Pinned here because it is the reason the guard's DV branch is defence-in-depth
+   * rather than a live path, and the reason that branch is unit-tested directly (see {@code
+   * TestDuplicateFileRegistrationGuard}) instead of through an action.
+   */
+  @TestTemplate
+  public void testIcebergItselfRefusesToCreateADuplicateDvRegistration() throws IOException {
+    Table table = createTableUnpartitioned(2, SCALE);
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table);
+    writePosDeletesForFiles(table, 2, DELETES_SCALE, dataFiles);
+
+    table.updateProperties().set(TableProperties.FORMAT_VERSION, "3").commit();
+    SparkActions.get(spark)
+        .rewritePositionDeletes(table)
+        .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+        .execute();
+
+    List<DeleteFile> dvs = deleteFiles(table);
+    assertThat(dvs).hasSize(2).allMatch(file -> file.format() == FileFormat.PUFFIN);
+    DeleteFile alreadyLive = dvs.get(0);
+
+    assertThatThrownBy(() -> table.newRowDelta().addDeletes(alreadyLive).commit())
+        .as("1.11 blocks a second DV for a data file that already has one")
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("Found concurrently added DV");
+  }
+
+  /** AFFIRM: how many distinct live data sequence numbers a file path is currently registered at. */
+  private long distinctLiveSequenceNumbersForPath(Table table, String path) {
+    return SparkTableUtil.loadMetadataTable(spark, table, MetadataTableType.ENTRIES)
+        .filter("status < 2")
+        .filter("data_file.file_path = '" + path + "'")
+        .select("sequence_number")
+        .distinct()
+        .count();
+  }
+
+  /** AFFIRM: every live file path registered at more than one distinct data sequence number. */
+  private List<Row> pathsWithMultipleLiveRegistrations(Table table) {
+    return SparkTableUtil.loadMetadataTable(spark, table, MetadataTableType.ENTRIES)
+        .filter("status < 2")
+        .selectExpr("data_file.file_path as file_path", "sequence_number")
+        .distinct()
+        .groupBy("file_path")
+        .count()
+        .filter("count > 1")
+        .collectAsList();
   }
 
   private List<Row> dvRecords(Table table) {

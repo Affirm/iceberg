@@ -82,6 +82,10 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   // live registration of that same path is a duplicate to be dropped. See
   // #dropDuplicateRegistrations for why the lowest sequence number is always the one kept.
   private final Map<String, Long> duplicateRegistrationKeepSequence = Maps.newHashMap();
+  // AFFIRM: locations passed to delete(F file) by the CALLER, as distinct from deleteFiles,
+  // which the filtering loop also writes to and which is never cleared between commit
+  // attempts. Only used by validateNoContradictoryDuplicateRegistrationIntent.
+  private final Set<String> callerDeletedFilePaths = Sets.newHashSet();
   // AFFIRM: paths from duplicateRegistrationKeepSequence actually observed live, at their
   // designated keep-sequence-number, during the CURRENT filterManifests() pass. Manifests are
   // processed in parallel (see filterManifests' Tasks.range(...).run(...)), so this must be
@@ -195,6 +199,12 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
     }
 
     deleteFiles.add(file);
+    // AFFIRM: caller-supplied deletions only. deleteFiles itself is ALSO written by the
+    // filtering loop (filterManifestWithDeletedFiles) and is never cleared -- not by
+    // invalidateFilteredCache, not anywhere -- so on a commit retry it contains paths this
+    // caller never asked to delete. validateNoContradictoryDuplicateRegistrationIntent must
+    // read this set instead, or it would blame the caller for the loop's own bookkeeping.
+    callerDeletedFilePaths.add(file.location().toString());
     deleteFilePartitions.add(file.specId(), file.partition());
   }
 
