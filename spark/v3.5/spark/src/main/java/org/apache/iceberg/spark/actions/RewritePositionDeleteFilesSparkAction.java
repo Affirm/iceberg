@@ -76,9 +76,7 @@ public class RewritePositionDeleteFilesSparkAction
           MAX_CONCURRENT_FILE_GROUP_REWRITES,
           PARTIAL_PROGRESS_ENABLED,
           PARTIAL_PROGRESS_MAX_COMMITS,
-          REWRITE_JOB_ORDER,
-          VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
-          RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
+          REWRITE_JOB_ORDER);
   private static final Result EMPTY_RESULT =
       ImmutableRewritePositionDeleteFiles.Result.builder().build();
 
@@ -116,29 +114,6 @@ public class RewritePositionDeleteFilesSparkAction
       LOG.info("Nothing found to rewrite in empty table {}", table.name());
       return EMPTY_RESULT;
     }
-
-    // AFFIRM: run before the planner is constructed, same ordering as RewriteDataFilesSparkAction
-    // -- if a repair here commits a fix, the planner must see the corrected snapshot, not one
-    // pinned before the repair ran. See DuplicateFileRegistrationGuard for why this action needs
-    // the same guard as RewriteDataFilesSparkAction rather than assuming rewrite_data_files
-    // already covered it: this action is run standalone in production oncall/backfill notebooks.
-    boolean validateDuplicateFileRegistrations =
-        PropertyUtil.propertyAsBoolean(
-            options(),
-            VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
-            VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
-    boolean resolveDuplicateFileRegistrations =
-        PropertyUtil.propertyAsBoolean(
-            options(),
-            RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
-            RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
-    DuplicateFileRegistrationGuard.validateOrRepair(
-        spark(),
-        table,
-        validateDuplicateFileRegistrations,
-        resolveDuplicateFileRegistrations,
-        VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
-        RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
 
     this.planner = new BinPackRewritePositionDeletePlanner(table, filter, caseSensitive);
 

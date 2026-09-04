@@ -33,7 +33,6 @@ import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.ImmutableRemoveDanglingDeleteFiles;
 import org.apache.iceberg.actions.RemoveDanglingDeleteFiles;
-import org.apache.iceberg.actions.RewriteDataFiles;
 import org.apache.iceberg.spark.JobGroupInfo;
 import org.apache.iceberg.spark.SparkDeleteFile;
 import org.apache.iceberg.types.Types;
@@ -65,23 +64,10 @@ class RemoveDanglingDeletesSparkAction
 
   private static final Logger LOG = LoggerFactory.getLogger(RemoveDanglingDeletesSparkAction.class);
   private final Table table;
-  private boolean skipDuplicateRegistrationCheck = false;
 
   protected RemoveDanglingDeletesSparkAction(SparkSession spark, Table table) {
     super(spark);
     this.table = table;
-  }
-
-  /**
-   * AFFIRM: skip the duplicate-file-registration check, for callers that have already run it.
-   *
-   * <p>{@link RewriteDataFilesSparkAction} runs {@link DuplicateFileRegistrationGuard} at the top
-   * of its own {@code execute()} and only invokes this action afterward, so re-scanning the
-   * entries table here would be a pure waste. Standalone callers must NOT set this.
-   */
-  RemoveDanglingDeletesSparkAction skipDuplicateRegistrationCheck() {
-    this.skipDuplicateRegistrationCheck = true;
-    return this;
   }
 
   @Override
@@ -96,24 +82,6 @@ class RemoveDanglingDeletesSparkAction
       return ImmutableRemoveDanglingDeleteFiles.Result.builder()
           .removedDeleteFiles(Collections.emptyList())
           .build();
-    }
-
-    // AFFIRM: this action reproduces the "delete side removes 2-of-2" half of the
-    // duplicate-file-registration defect. doExecute() below hands each dangling delete file to
-    // RewriteFiles#deleteFile, whose identity for manifest-filtering purposes is DeleteFileSet's
-    // key -- (location, contentOffset, contentSizeInBytes) -- which is IDENTICAL across two live
-    // registrations of the same physical file at different data sequence numbers. So dropping
-    // the one genuinely-dangling registration also drops a sibling registration that may still
-    // legitimately cover live data, resurrecting suppressed rows. Detect and repair first.
-    if (!skipDuplicateRegistrationCheck) {
-      DuplicateFileRegistrationGuard.validateOrRepair(
-          spark(),
-          table,
-          true,
-          true,
-          RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
-          RewriteDataFiles.RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
-      table.refresh();
     }
 
     String desc = String.format("Removing dangling delete files in %s", table.name());

@@ -82,9 +82,7 @@ public class RewriteDataFilesSparkAction
           REWRITE_JOB_ORDER,
           OUTPUT_SPEC_ID,
           REMOVE_DANGLING_DELETES,
-          BinPackRewriteFilePlanner.MAX_FILES_TO_REWRITE,
-          VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
-          RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
+          BinPackRewriteFilePlanner.MAX_FILES_TO_REWRITE);
 
   private static final RewriteDataFilesSparkAction.Result EMPTY_RESULT =
       ImmutableRewriteDataFiles.Result.builder().rewriteResults(ImmutableList.of()).build();
@@ -178,24 +176,6 @@ public class RewriteDataFilesSparkAction
         "Cannot rewrite data files for branch %s: branch does not exist",
         branch);
 
-    // AFFIRM: read directly from options() rather than through a class field populated by
-    // validateAndInitOptions(). That method runs inside init(startingSnapshotId) below and
-    // requires `planner` to already be constructed against a startingSnapshotId -- but if a
-    // repair here commits a fix, startingSnapshotId must be re-read afterward, before planner
-    // exists at all. Reading the option directly avoids that ordering conflict.
-    boolean validateDuplicateFileRegistrations =
-        PropertyUtil.propertyAsBoolean(
-            options(),
-            VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
-            VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
-    if (validateDuplicateFileRegistrations) {
-      validateNoDuplicateFileRegistrations();
-    }
-
-    // AFFIRM: captured AFTER the duplicate-registration check, not before. If that check
-    // committed a repair, `planner` below must be constructed against the corrected snapshot --
-    // capturing this earlier would silently plan against the pre-repair snapshot and defeat the
-    // repair.
     long startingSnapshotId = table.snapshot(branch).snapshotId();
 
     init(startingSnapshotId);
@@ -214,41 +194,14 @@ public class RewriteDataFilesSparkAction
     ImmutableRewriteDataFiles.Result result = resultBuilder.build();
 
     if (removeDanglingDeletes) {
-      // AFFIRM: skipDuplicateRegistrationCheck() because this invocation's
-      // duplicate-registration policy was already settled at the top of execute() -- either the
-      // guard ran and repaired, or the caller explicitly set
-      // validate-duplicate-file-registrations=false. Either way, re-deciding it here would be
-      // redundant at best and would override the caller's opt-out at worst.
       RemoveDanglingDeletesSparkAction action =
-          new RemoveDanglingDeletesSparkAction(spark(), table).skipDuplicateRegistrationCheck();
+          new RemoveDanglingDeletesSparkAction(spark(), table);
       int removedDeleteFiles = Iterables.size(action.execute().removedDeleteFiles());
       return result.withRemovedDeleteFilesCount(
           result.removedDeleteFilesCount() + removedDeleteFiles);
     }
 
     return result;
-  }
-
-  /**
-   * AFFIRM: delegates to {@link DuplicateFileRegistrationGuard}, shared with {@link
-   * RewritePositionDeleteFilesSparkAction} -- the same duplicate-registration defect is reachable
-   * through either action, since both commit through {@code ManifestFilterManager}. See that
-   * class's javadoc for why this guard could not stay local to just this one action.
-   */
-  @VisibleForTesting
-  void validateNoDuplicateFileRegistrations() {
-    boolean resolveDuplicateFileRegistrations =
-        PropertyUtil.propertyAsBoolean(
-            options(),
-            RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
-            RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
-    DuplicateFileRegistrationGuard.validateOrRepair(
-        spark(),
-        table,
-        true,
-        resolveDuplicateFileRegistrations,
-        VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
-        RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
   }
 
   private void init(long startingSnapshotId) {
