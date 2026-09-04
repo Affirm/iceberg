@@ -119,7 +119,13 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
           .build();
   static final DataFile FILE_D2 =
       DataFiles.builder(SPEC)
-          .withPath("/path/to/data-d.parquet")
+          // AFFIRM: was "/path/to/data-d.parquet" -- the same path as FILE_D, which made every
+          // fixture appending both a genuine duplicate registration of one path at two data
+          // sequence numbers, i.e. exactly the corruption this PR guards against. Almost
+          // certainly a copy-paste slip: FILE_A2/B2/C2 all use the -a2/-b2/-c2 suffix, and
+          // spark/v3.5's copy of this same file has "/path/to/data-d2.parquet" correctly. Found
+          // because the new guard repaired it and two previously-passing tests changed answer.
+          .withPath("/path/to/data-d2.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=d") // easy way to set partition data for now
           .withRecordCount(1)
@@ -500,15 +506,88 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
         .containsExactlyInAnyOrder(fileBDeletes.location(), fileB2Deletes.location());
 
     List<Tuple2<Long, String>> actualAfter = liveEntries();
+    // AFFIRM: expectations changed by the duplicate-file-registration guard, deliberately.
+    //
+    // Note what this test's own setup does above: it appends FILE_A and FILE_C at sequence 1,
+    // then `addRows(FILE_A).addRows(FILE_C)` AGAIN at sequence 2. That leaves each of those two
+    // paths live at two different data sequence numbers -- which is precisely the corrupt state
+    // that caused the production incident this guard exists for, used here (upstream) merely as
+    // a convenient fixture for producing dangling DVs.
+    //
+    // RemoveDanglingDeletesSparkAction now detects and repairs that before doing its own work,
+    // because its dangling-delete removal keys delete-file identity on
+    // (location, contentOffset, contentSizeInBytes) -- identical across both registrations of
+    // one physical file -- so operating on such a table can drop a sibling registration that
+    // still legitimately covers live data. After the repair, only the lowest registration of
+    // FILE_A and FILE_C survives, so the sequence-2 duplicates are correctly absent below.
+    //
+    // The action's actual contract under test here is unchanged and still asserted above: the
+    // two dangling FILE_B DVs are the delete files removed. That this fixture happened to be
+    // built on a duplicate registration is incidental to what it was written to verify.
     List<Tuple2<Long, String>> expectedAfter =
         ImmutableList.of(
             Tuple2.apply(1L, FILE_A.location()),
             Tuple2.apply(1L, FILE_C.location()),
             Tuple2.apply(1L, FILE_D.location()),
-            Tuple2.apply(2L, FILE_A.location()),
-            Tuple2.apply(2L, FILE_C.location()),
             Tuple2.apply(2L, fileADeletes.location()));
     assertThat(actualAfter).containsExactlyInAnyOrderElementsOf(expectedAfter);
+  }
+
+  /**
+   * AFFIRM: the defect this action's new duplicate-registration guard exists to prevent, driven
+   * deliberately rather than incidentally.
+   *
+   * <p>Without the guard, this action reproduces the "delete side removes 2-of-2" half of the
+   * production incident. {@code doExecute} hands each dangling delete file to {@code
+   * RewriteFiles#deleteFile}, whose identity for manifest filtering is {@code DeleteFileSet}'s key
+   * -- {@code (location, contentOffset, contentSizeInBytes)} -- which is IDENTICAL across two live
+   * registrations of the same physical file at different data sequence numbers. So dropping the one
+   * genuinely-dangling registration would also drop the sibling registration that still
+   * legitimately covers live data, resurrecting the rows it suppressed.
+   *
+   * <p>Here a delete file that DOES still cover live data is duplicated. Nothing about it is
+   * dangling, so a correct run must remove nothing at all -- and, because the guard repairs the
+   * duplicate first, must leave exactly one live registration of it behind rather than zero.
+   */
+  @TestTemplate
+  public void testDoesNotDropADuplicatedDeleteFileThatStillCoversLiveData() {
+    // v2 position deletes only: a duplicated V3 deletion vector is deliberately refused rather
+    // than auto-repaired (a Puffin file legitimately holds several distinct delete files at one
+    // location), which is covered separately in TestRewritePositionDeleteFilesAction.
+    assumeThat(formatVersion).isEqualTo(2);
+    setupPartitionedTable();
+
+    table.newAppend().appendFile(FILE_A).commit();
+    DeleteFile fileADeletes = fileADeletes();
+    table.newRowDelta().addDeletes(fileADeletes).commit();
+
+    // Duplicate the delete file's registration: the CommitStateUnknownException-retry shape,
+    // applied to the delete side. FILE_A is still live, so neither registration is dangling.
+    table.newRowDelta().addDeletes(fileADeletes).commit();
+
+    long liveRegistrationsBefore =
+        liveEntries().stream().filter(e -> e._2().equals(fileADeletes.location())).count();
+    assertThat(liveRegistrationsBefore)
+        .as("Both delete-file registrations must be live before the action runs")
+        .isEqualTo(2);
+
+    RemoveDanglingDeleteFiles.Result result =
+        SparkActions.get().removeDanglingDeleteFiles(table).execute();
+
+    assertThat(result.removedDeleteFiles())
+        .as("Nothing here is dangling -- FILE_A is live, so no delete file may be removed")
+        .isEmpty();
+
+    long liveRegistrationsAfter =
+        liveEntries().stream().filter(e -> e._2().equals(fileADeletes.location())).count();
+    assertThat(liveRegistrationsAfter)
+        .as(
+            "The guard must repair the duplicate to exactly one live registration -- not zero "
+                + "(which is the 2-of-2 removal bug) and not two (unrepaired)")
+        .isEqualTo(1);
+    assertThat(liveEntries())
+        .as("The data file it covers must still be live")
+        .anyMatch(e -> e._2().equals(FILE_A.location()));
   }
 
   private List<Tuple2<Long, String>> liveEntries() {
