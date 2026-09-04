@@ -119,7 +119,13 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
           .build();
   static final DataFile FILE_D2 =
       DataFiles.builder(SPEC)
-          .withPath("/path/to/data-d.parquet")
+          // AFFIRM: was "/path/to/data-d.parquet" -- the same path as FILE_D, which made every
+          // fixture appending both a genuine duplicate registration of one path at two data
+          // sequence numbers, i.e. exactly the corruption this PR guards against. Almost
+          // certainly a copy-paste slip: FILE_A2/B2/C2 all use the -a2/-b2/-c2 suffix, and
+          // spark/v3.5's copy of this same file has "/path/to/data-d2.parquet" correctly. Found
+          // because the new guard repaired it and two previously-passing tests changed answer.
+          .withPath("/path/to/data-d2.parquet")
           .withFileSizeInBytes(10)
           .withPartitionPath("c1=d") // easy way to set partition data for now
           .withRecordCount(1)
