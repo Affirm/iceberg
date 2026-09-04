@@ -184,6 +184,17 @@ public class RewriteDataFilesSparkAction
 
     if (plan.totalGroupCount() == 0) {
       LOG.info("Nothing found to rewrite in {}", table.name());
+      // AFFIRM: still run dangling-delete removal on this path. `delete-file-threshold` normally
+      // guarantees a non-empty group set, EXCEPT in the exact stuck state this feature exists to
+      // escape: once the only remaining delete files are already dangling, no data file qualifies
+      // for rewrite, so totalGroupCount() == 0 and returning here would leave them in place
+      // forever. Not covered by apache/iceberg#15727, which does not touch this file; the hole is
+      // still present upstream on main.
+      if (removeDanglingDeletes) {
+        return removeDanglingDeletesAndBuild(
+            ImmutableRewriteDataFiles.Result.builder().rewriteResults(ImmutableList.of()).build());
+      }
+
       return EMPTY_RESULT;
     }
 
@@ -194,11 +205,7 @@ public class RewriteDataFilesSparkAction
     ImmutableRewriteDataFiles.Result result = resultBuilder.build();
 
     if (removeDanglingDeletes) {
-      RemoveDanglingDeletesSparkAction action =
-          new RemoveDanglingDeletesSparkAction(spark(), table);
-      int removedDeleteFiles = Iterables.size(action.execute().removedDeleteFiles());
-      return result.withRemovedDeleteFilesCount(
-          result.removedDeleteFilesCount() + removedDeleteFiles);
+      return removeDanglingDeletesAndBuild(result);
     }
 
     return result;
@@ -216,6 +223,23 @@ public class RewriteDataFilesSparkAction
     }
 
     validateAndInitOptions();
+  }
+
+  /**
+   * AFFIRM: extracted so the dangling-delete removal can also run on the "nothing to rewrite" early
+   * return path above, not just after a successful data rewrite. Takes the already-built Result,
+   * not a Builder: on 1.11, a rewrite can already report a non-zero removedDeleteFilesCount on its
+   * own (e.g. orphaned DVs dropped as part of the rewrite commit itself -- see
+   * TestRewriteDataFilesAction#testRemoveDangledPositionDeletesPartitionEvolution's v3 case), and
+   * result.removedDeleteFilesCount() is a sum over rewriteResults() computed lazily on first read.
+   * Setting a raw Builder field here would silently overwrite that baseline instead of adding to
+   * it.
+   */
+  private ImmutableRewriteDataFiles.Result removeDanglingDeletesAndBuild(
+      ImmutableRewriteDataFiles.Result result) {
+    RemoveDanglingDeletesSparkAction action = new RemoveDanglingDeletesSparkAction(spark(), table);
+    int removedCount = Iterables.size(action.execute().removedDeleteFiles());
+    return result.withRemovedDeleteFilesCount(result.removedDeleteFilesCount() + removedCount);
   }
 
   @VisibleForTesting
