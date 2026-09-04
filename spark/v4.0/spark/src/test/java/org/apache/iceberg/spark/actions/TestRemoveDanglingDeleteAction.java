@@ -541,8 +541,8 @@ public class TestRemoveDanglingDeleteAction extends TestBase {
    * production incident. {@code doExecute} hands each dangling delete file to {@code
    * RewriteFiles#deleteFile}, whose identity for manifest filtering is {@code DeleteFileSet}'s key
    * -- {@code (location, contentOffset, contentSizeInBytes)} -- which is IDENTICAL across two live
-   * registrations of the same physical file at different data sequence numbers. So dropping the
-   * one genuinely-dangling registration would also drop the sibling registration that still
+   * registrations of the same physical file at different data sequence numbers. So dropping the one
+   * genuinely-dangling registration would also drop the sibling registration that still
    * legitimately covers live data, resurrecting the rows it suppressed.
    *
    * <p>Here a delete file that DOES still cover live data is duplicated. Nothing about it is

@@ -2225,7 +2225,9 @@ public class TestRewriteDataFilesAction extends TestBase {
     return actual;
   }
 
-  /** AFFIRM: how many distinct live data sequence numbers a file path is currently registered at. */
+  /**
+   * AFFIRM: how many distinct live data sequence numbers a file path is currently registered at.
+   */
   protected long distinctLiveSequenceNumbersForPath(Table table, String path) {
     return SparkTableUtil.loadMetadataTable(spark, table, MetadataTableType.ENTRIES)
         .filter("status < 2")
@@ -2479,8 +2481,7 @@ public class TestRewriteDataFilesAction extends TestBase {
     // commits each hit the CommitStateUnknownException retry race.
     table.newAppend().appendFile(first).commit();
     table.newAppend().appendFile(second).commit();
-    assertThat(distinctLiveSequenceNumbersForPath(table, first.location().toString()))
-        .isEqualTo(2);
+    assertThat(distinctLiveSequenceNumbersForPath(table, first.location().toString())).isEqualTo(2);
     assertThat(distinctLiveSequenceNumbersForPath(table, second.location().toString()))
         .isEqualTo(2);
 

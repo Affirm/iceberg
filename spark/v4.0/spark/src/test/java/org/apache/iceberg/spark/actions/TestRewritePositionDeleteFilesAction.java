@@ -919,7 +919,8 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
             () ->
                 SparkActions.get(spark)
                     .rewritePositionDeletes(table)
-                    .option(RewritePositionDeleteFiles.RESOLVE_DUPLICATE_FILE_REGISTRATIONS, "false")
+                    .option(
+                        RewritePositionDeleteFiles.RESOLVE_DUPLICATE_FILE_REGISTRATIONS, "false")
                     .execute())
         .isInstanceOf(ValidationException.class)
         .hasMessageContaining("registered at more than one data sequence number")
@@ -933,8 +934,8 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
    * migrating to V3 and re-adding a live DV. That is impossible: {@code BaseRowDelta#validate}
    * calls {@code validateAddedDVs} unconditionally, so the second {@code addDeletes} of a DV whose
    * referenced data file already has one is rejected with "Found concurrently added DV for
-   * file...". Pinned here because it is the reason the guard's DV branch is defence-in-depth
-   * rather than a live path, and the reason that branch is unit-tested directly (see {@code
+   * file...". Pinned here because it is the reason the guard's DV branch is defence-in-depth rather
+   * than a live path, and the reason that branch is unit-tested directly (see {@code
    * TestDuplicateFileRegistrationGuard}) instead of through an action.
    */
   @TestTemplate
@@ -959,7 +960,9 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
         .hasMessageContaining("Found concurrently added DV");
   }
 
-  /** AFFIRM: how many distinct live data sequence numbers a file path is currently registered at. */
+  /**
+   * AFFIRM: how many distinct live data sequence numbers a file path is currently registered at.
+   */
   private long distinctLiveSequenceNumbersForPath(Table table, String path) {
     return SparkTableUtil.loadMetadataTable(spark, table, MetadataTableType.ENTRIES)
         .filter("status < 2")

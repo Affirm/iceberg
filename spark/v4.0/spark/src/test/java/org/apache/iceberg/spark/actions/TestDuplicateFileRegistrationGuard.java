@@ -51,8 +51,7 @@ public class TestDuplicateFileRegistrationGuard {
           .add("distinct_sequence_numbers", DataTypes.LongType);
 
   private static Row duplicate(String path, FileContent content) {
-    return new GenericRowWithSchema(
-        new Object[] {path, content.id(), 1L, 2L}, DUPLICATE_SCHEMA);
+    return new GenericRowWithSchema(new Object[] {path, content.id(), 1L, 2L}, DUPLICATE_SCHEMA);
   }
 
   @Test
@@ -82,7 +81,9 @@ public class TestDuplicateFileRegistrationGuard {
       assertThat(
               DuplicateFileRegistrationGuard.hasUnsafeDeletionVectorDuplicate(
                   formatVersion, positionDeletes))
-          .as("Below v3 a delete file owns its whole location, so repair is safe (v%s)", formatVersion)
+          .as(
+              "Below v3 a delete file owns its whole location, so repair is safe (v%s)",
+              formatVersion)
           .isFalse();
       assertThat(
               DuplicateFileRegistrationGuard.hasUnsafeDeletionVectorDuplicate(
@@ -138,7 +139,8 @@ public class TestDuplicateFileRegistrationGuard {
 
   @Test
   public void testEmptyDuplicateListIsNeverUnsafe() {
-    assertThat(DuplicateFileRegistrationGuard.hasUnsafeDeletionVectorDuplicate(4, ImmutableList.of()))
+    assertThat(
+            DuplicateFileRegistrationGuard.hasUnsafeDeletionVectorDuplicate(4, ImmutableList.of()))
         .isFalse();
   }
 }

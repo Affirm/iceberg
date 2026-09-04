@@ -76,8 +76,8 @@ class RemoveDanglingDeletesSparkAction
    * AFFIRM: skip the duplicate-file-registration check, for callers that have already run it.
    *
    * <p>{@link RewriteDataFilesSparkAction} runs {@link DuplicateFileRegistrationGuard} at the top
-   * of its own {@code execute()} and only invokes this action afterward, so re-scanning the
-   * entries table here would be a pure waste. Standalone callers must NOT set this.
+   * of its own {@code execute()} and only invokes this action afterward, so re-scanning the entries
+   * table here would be a pure waste. Standalone callers must NOT set this.
    */
   RemoveDanglingDeletesSparkAction skipDuplicateRegistrationCheck() {
     this.skipDuplicateRegistrationCheck = true;
