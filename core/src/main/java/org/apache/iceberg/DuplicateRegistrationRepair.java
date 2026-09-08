@@ -24,30 +24,30 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 
 /**
  * AFFIRM: repairs a table where a data or delete file was registered more than once at different
- * data sequence numbers -- the state {@link org.apache.iceberg.actions.RewriteDataFiles}'
- * {@code validate-duplicate-file-registrations} check refuses to compact.
+ * data sequence numbers -- the state {@link org.apache.iceberg.actions.RewriteDataFiles}' {@code
+ * validate-duplicate-file-registrations} check refuses to compact.
  *
- * <p>A single physical file registered twice is not something a healthy writer produces. It
- * arises when a commit is retried after its outcome became unknown (for example {@link
+ * <p>A single physical file registered twice is not something a healthy writer produces. It arises
+ * when a commit is retried after its outcome became unknown (for example {@link
  * org.apache.iceberg.exceptions.CommitStateUnknownException}) and the retry re-registers a
- * WriteResult that had in fact already been applied. Left alone, this corrupts the next
- * compaction: file identity in the rewrite path is keyed on location alone, so the two
- * registrations are indistinguishable there -- the data side collapses them into one manifest
- * reference and removes only one, while the delete side has no sequence number to key on and
- * removes both, leaving the surviving data registration with no delete coverage and resurrecting
- * rows that were correctly suppressed.
+ * WriteResult that had in fact already been applied. Left alone, this corrupts the next compaction:
+ * file identity in the rewrite path is keyed on location alone, so the two registrations are
+ * indistinguishable there -- the data side collapses them into one manifest reference and removes
+ * only one, while the delete side has no sequence number to key on and removes both, leaving the
+ * surviving data registration with no delete coverage and resurrecting rows that were correctly
+ * suppressed.
  *
- * <p>For every duplicated path, callers must keep the LOWEST live data sequence number
- * registered for that path -- not an arbitrary choice. See {@link
- * ManifestFilterManager#dropDuplicateRegistrations} for why: any delete file committed between
- * two duplicate registrations has a sequence number greater than the lower one, so it continues
- * to cover a registration kept at the lower sequence number. Keeping the higher one instead would
+ * <p>For every duplicated path, callers must keep the LOWEST live data sequence number registered
+ * for that path -- not an arbitrary choice. See {@link
+ * ManifestFilterManager#dropDuplicateRegistrations} for why: any delete file committed between two
+ * duplicate registrations has a sequence number greater than the lower one, so it continues to
+ * cover a registration kept at the lower sequence number. Keeping the higher one instead would
  * silently drop that coverage and reproduce the exact defect this repairs.
  *
- * <p>Callers are expected to have already identified the duplicated paths and their live
- * sequence numbers (for example via a scan of the {@code entries} metadata table), and to supply
- * only the sequence number to KEEP per path -- every other live registration of that path is
- * dropped from the new snapshot.
+ * <p>Callers are expected to have already identified the duplicated paths and their live sequence
+ * numbers (for example via a scan of the {@code entries} metadata table), and to supply only the
+ * sequence number to KEEP per path -- every other live registration of that path is dropped from
+ * the new snapshot.
  */
 public class DuplicateRegistrationRepair
     extends MergingSnapshotProducer<DuplicateRegistrationRepair> {
@@ -76,8 +76,8 @@ public class DuplicateRegistrationRepair
    * <p><b>Not validated by this method:</b> the caller alone is responsible for {@code
    * sequenceNumber} actually being the lowest live one for {@code path}. This class has no cheap
    * way to verify that without itself scanning the manifests it exists to avoid opening
-   * unnecessarily. Passing anything other than the true minimum silently reproduces the defect
-   * this class repairs.
+   * unnecessarily. Passing anything other than the true minimum silently reproduces the defect this
+   * class repairs.
    *
    * @param path the duplicated data file's location
    * @param sequenceNumber the lowest live data sequence number registered for that path
@@ -90,14 +90,14 @@ public class DuplicateRegistrationRepair
   }
 
   /**
-   * Marks {@code sequenceNumber} as the live data sequence number to keep for a duplicated
-   * delete file path. Every other live registration of that same path is dropped.
+   * Marks {@code sequenceNumber} as the live data sequence number to keep for a duplicated delete
+   * file path. Every other live registration of that same path is dropped.
    *
    * <p><b>Not validated by this method:</b> the caller alone is responsible for {@code
    * sequenceNumber} actually being the lowest live one for {@code path}. This class has no cheap
    * way to verify that without itself scanning the manifests it exists to avoid opening
-   * unnecessarily. Passing anything other than the true minimum silently reproduces the defect
-   * this class repairs.
+   * unnecessarily. Passing anything other than the true minimum silently reproduces the defect this
+   * class repairs.
    *
    * @param path the duplicated delete file's location
    * @param sequenceNumber the lowest live data sequence number registered for that path

@@ -19,7 +19,6 @@
 package org.apache.iceberg.spark.actions;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import org.apache.iceberg.DeleteFile;
@@ -33,8 +32,10 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.actions.ImmutableRemoveDanglingDeleteFiles;
 import org.apache.iceberg.actions.RemoveDanglingDeleteFiles;
+import org.apache.iceberg.actions.RewriteDataFiles;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.JobGroupInfo;
 import org.apache.iceberg.util.DeleteFileSet;
 import org.apache.spark.sql.SparkSession;
@@ -51,6 +52,7 @@ class RemoveDanglingDeletesSparkAction
 
   private static final Logger LOG = LoggerFactory.getLogger(RemoveDanglingDeletesSparkAction.class);
   private final Table table;
+  private boolean skipDuplicateRegistrationCheck = false;
 
   protected RemoveDanglingDeletesSparkAction(SparkSession spark, Table table) {
     super(spark);
@@ -62,8 +64,38 @@ class RemoveDanglingDeletesSparkAction
     return this;
   }
 
+  /**
+   * AFFIRM: skip the duplicate-file-registration check, for callers that have already run it.
+   *
+   * <p>{@link RewriteDataFilesSparkAction} runs {@link DuplicateFileRegistrationGuard} at the top
+   * of its own {@code execute()} and only invokes this action afterward, so re-scanning the entries
+   * table here would be a pure waste. Standalone callers must NOT set this.
+   */
+  RemoveDanglingDeletesSparkAction skipDuplicateRegistrationCheck() {
+    this.skipDuplicateRegistrationCheck = true;
+    return this;
+  }
+
   @Override
   public Result execute() {
+    // AFFIRM: this action reproduces the "delete side removes 2-of-2" half of the
+    // duplicate-file-registration defect. doExecute() below hands each dangling delete file to
+    // RewriteFiles#deleteFile, whose identity for manifest-filtering purposes is DeleteFileSet's
+    // key -- (location, contentOffset, contentSizeInBytes) -- which is IDENTICAL across two live
+    // registrations of the same physical file at different data sequence numbers. So dropping
+    // the one genuinely-dangling registration also drops a sibling registration that may still
+    // legitimately cover live data, resurrecting suppressed rows. Detect and repair first.
+    if (!skipDuplicateRegistrationCheck) {
+      DuplicateFileRegistrationGuard.validateOrRepair(
+          spark(),
+          table,
+          true,
+          true,
+          RewriteDataFiles.VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+          RewriteDataFiles.RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
+      table.refresh();
+    }
+
     String desc = String.format("Removing dangling delete files in %s", table.name());
     JobGroupInfo info = newJobGroupInfo("REMOVE-DELETES", desc);
     return withJobGroupInfo(info, this::doExecute);
@@ -145,6 +177,6 @@ class RemoveDanglingDeletesSparkAction
 
     // AFFIRM: upstream uses Stream.toList(), which is Java 16+. Iceberg 1.8.1 compiles with
     // options.release = 11 (build.gradle:191), so this is a hard compile error there.
-    return new ArrayList<>(danglingDeletes);
+    return Lists.newArrayList(danglingDeletes);
   }
 }
