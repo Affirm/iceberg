@@ -87,7 +87,9 @@ public class RewriteDataFilesSparkAction
           USE_STARTING_SEQUENCE_NUMBER,
           REWRITE_JOB_ORDER,
           OUTPUT_SPEC_ID,
-          REMOVE_DANGLING_DELETES);
+          REMOVE_DANGLING_DELETES,
+          VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+          RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
 
   private static final RewriteDataFilesSparkAction.Result EMPTY_RESULT =
       ImmutableRewriteDataFiles.Result.builder().rewriteResults(ImmutableList.of()).build();
@@ -100,6 +102,8 @@ public class RewriteDataFilesSparkAction
   private int maxFailedCommits;
   private boolean partialProgressEnabled;
   private boolean removeDanglingDeletes;
+  private boolean validateDuplicateFileRegistrations;
+  private boolean resolveDuplicateFileRegistrations;
   private boolean useStartingSequenceNumber;
   private RewriteJobOrder rewriteJobOrder;
   private FileRewriter<FileScanTask, DataFile> rewriter = null;
@@ -162,14 +166,22 @@ public class RewriteDataFilesSparkAction
       return EMPTY_RESULT;
     }
 
-    long startingSnapshotId = table.currentSnapshot().snapshotId();
-
     // Default to BinPack if no strategy selected
     if (this.rewriter == null) {
       this.rewriter = new SparkBinPackDataRewriter(spark(), table);
     }
 
     validateAndInitOptions();
+
+    if (validateDuplicateFileRegistrations) {
+      validateNoDuplicateFileRegistrations();
+    }
+
+    // AFFIRM: captured AFTER the duplicate-registration check, not before. If
+    // repairDuplicateFileRegistrations() committed a fix above, both the file-group scan below
+    // and the final rewrite commit must start from that corrected snapshot -- capturing this
+    // earlier would silently plan against the pre-repair snapshot and defeat the repair.
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
 
     StructLikeMap<List<List<FileScanTask>>> fileGroupsByPartition =
         planFileGroups(startingSnapshotId);
@@ -209,10 +221,34 @@ public class RewriteDataFilesSparkAction
    * return path above, not just after a successful data rewrite.
    */
   private RewriteDataFiles.Result removeDanglingDeletesAndBuild(Builder resultBuilder) {
-    RemoveDanglingDeletesSparkAction action = new RemoveDanglingDeletesSparkAction(spark(), table);
+    // AFFIRM: skipDuplicateRegistrationCheck() because this invocation's duplicate-registration
+    // policy was already settled at the top of execute() -- either the guard ran and repaired, or
+    // the caller explicitly set validate-duplicate-file-registrations=false. Either way,
+    // re-deciding it here would be redundant at best and would override the caller's opt-out at
+    // worst.
+    RemoveDanglingDeletesSparkAction action =
+        new RemoveDanglingDeletesSparkAction(spark(), table).skipDuplicateRegistrationCheck();
     int removedCount = Iterables.size(action.execute().removedDeleteFiles());
     resultBuilder.removedDeleteFilesCount(removedCount);
     return resultBuilder.build();
+  }
+
+  /**
+   * AFFIRM: delegates to {@link DuplicateFileRegistrationGuard}, shared with {@link
+   * RewritePositionDeleteFilesSparkAction} and {@link RemoveDanglingDeletesSparkAction} -- the same
+   * duplicate-registration defect is reachable through any of the three, since all commit through
+   * {@code ManifestFilterManager}. See that class's javadoc for why this guard could not stay local
+   * to just this one action.
+   */
+  @VisibleForTesting
+  void validateNoDuplicateFileRegistrations() {
+    DuplicateFileRegistrationGuard.validateOrRepair(
+        spark(),
+        table,
+        validateDuplicateFileRegistrations,
+        resolveDuplicateFileRegistrations,
+        VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+        RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
   }
 
   StructLikeMap<List<List<FileScanTask>>> planFileGroups(long startingSnapshotId) {
@@ -492,6 +528,18 @@ public class RewriteDataFilesSparkAction
     removeDanglingDeletes =
         PropertyUtil.propertyAsBoolean(
             options(), REMOVE_DANGLING_DELETES, REMOVE_DANGLING_DELETES_DEFAULT);
+
+    validateDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
+
+    resolveDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
 
     rewriteJobOrder =
         RewriteJobOrder.fromName(

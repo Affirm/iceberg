@@ -73,6 +73,21 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   private final Set<String> manifestsWithDeletes = Sets.newHashSet();
   private final PartitionSet dropPartitions;
   private final CharSequenceSet deletePaths = CharSequenceSet.empty();
+  // AFFIRM: path -> the one data sequence number at that path which must survive; every other
+  // live registration of that same path is a duplicate to be dropped. See
+  // #dropDuplicateRegistrations for why the lowest sequence number is always the one kept.
+  private final Map<String, Long> duplicateRegistrationKeepSequence = Maps.newHashMap();
+  // AFFIRM: locations passed to delete(F file) by the CALLER, as distinct from deleteFiles,
+  // which the filtering loop also writes to and which is never cleared between commit
+  // attempts. Only used by validateNoContradictoryDuplicateRegistrationIntent.
+  private final Set<String> callerDeletedFilePaths = Sets.newHashSet();
+  // AFFIRM: paths from duplicateRegistrationKeepSequence actually observed live, at their
+  // designated keep-sequence-number, during the CURRENT filterManifests() pass. Manifests are
+  // processed in parallel (see filterManifests' Tasks.range(...).run(...)), so this must be
+  // thread-safe. Cleared at the start of every filterManifests() call -- see
+  // validateDuplicateRegistrationSurvivorsPresent for why a stale entry from a prior, failed
+  // commit attempt must never satisfy this check on a later retry.
+  private final Set<String> duplicateRegistrationSurvivorsSeen = Sets.newConcurrentHashSet();
   private Expression deleteExpression = Expressions.alwaysFalse();
   private long minSequenceNumber = 0;
   private boolean failAnyDelete = false;
@@ -166,6 +181,13 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
       manifestsWithDeletes.add(file.manifestLocation());
     }
 
+    // AFFIRM: caller-supplied deletions only. deleteFiles itself is ALSO written by the
+    // filtering loop (filterManifestWithDeletedFiles) and is never cleared -- not by
+    // invalidateFilteredCache, not anywhere -- so on a commit retry it contains paths this
+    // caller never asked to delete. validateNoContradictoryDuplicateRegistrationIntent must
+    // read this set instead, or it would blame the caller for the loop's own bookkeeping.
+    callerDeletedFilePaths.add(file.location().toString());
+
     deleteFiles.add(file);
     deleteFilePartitions.add(file.specId(), file.partition());
   }
@@ -178,11 +200,129 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
     deletePaths.add(path);
   }
 
+  /**
+   * AFFIRM: repairs a file that was registered more than once at different data sequence numbers,
+   * keeping exactly one registration per path and dropping the rest.
+   *
+   * <p>A single physical file registered twice is not something a healthy writer produces. It
+   * arises when a commit is retried after its outcome became unknown (for example {@link
+   * org.apache.iceberg.exceptions.CommitStateUnknownException}) and the retry re-registers a
+   * WriteResult that had in fact already been applied. Left alone, this corrupts the next
+   * compaction: {@code DataFileSet}/{@code DeleteFileSet} key file identity on location alone, so
+   * the data side collapses the two registrations into one manifest reference and only removes one
+   * of them, while the delete side has no sequence number to key on at all and removes both --
+   * leaving the surviving data registration with no delete coverage and resurrecting rows that were
+   * correctly suppressed.
+   *
+   * <p>The value in {@code keepSequenceNumberByPath} for each path MUST be the lowest live data
+   * sequence number registered for that path, not an arbitrary choice. Any delete file committed
+   * between two duplicate registrations has a sequence number greater than the lower one, so it
+   * continues to cover a registration kept at the lower sequence number. Keeping the higher one
+   * instead would silently drop that coverage and reproduce the exact defect this repairs.
+   *
+   * <p>Applies uniformly regardless of content type: a duplicate registration of a delete file is
+   * exactly as dangerous to whatever later reads it as a duplicate data file registration is, so
+   * both filter managers ({@code DataFile} and {@code DeleteFile}) are driven the same way.
+   *
+   * @param keepSequenceNumberByPath a map from file location to the one live data sequence number
+   *     at that location which must be kept; every other live registration at that location is
+   *     deleted from the new snapshot
+   */
+  protected void dropDuplicateRegistrations(Map<String, Long> keepSequenceNumberByPath) {
+    Preconditions.checkNotNull(
+        keepSequenceNumberByPath, "Cannot drop duplicate registrations using: null");
+    if (keepSequenceNumberByPath.isEmpty()) {
+      return;
+    }
+    invalidateFilteredCache();
+    this.duplicateRegistrationKeepSequence.putAll(keepSequenceNumberByPath);
+    this.allDeletesReferenceManifests = false;
+  }
+
+  // AFFIRM: true if this exact live registration (this path at this data sequence number) is a
+  // duplicate that must be dropped, i.e. a *different* sequence number was chosen to survive for
+  // this same path. As a side effect, records the path as confirmed-live when THIS is the
+  // survivor entry (see duplicateRegistrationSurvivorsSeen and
+  // validateDuplicateRegistrationSurvivorsPresent for why: a commit retry against a base a
+  // concurrent writer already changed must not silently drop every registration of a path whose
+  // survivor vanished out from under it).
+  private boolean isDuplicateRegistrationToDrop(F file, ManifestEntry<F> entry) {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return false;
+    }
+    String path = file.location().toString();
+    Long keepSequenceNumber = duplicateRegistrationKeepSequence.get(path);
+    if (keepSequenceNumber == null) {
+      return false;
+    }
+    if (keepSequenceNumber.equals(entry.dataSequenceNumber())) {
+      duplicateRegistrationSurvivorsSeen.add(path);
+      return false;
+    }
+    return true;
+  }
+
+  // Every caller MUST evaluate this method unconditionally into a local variable before
+  // combining it into a || chain, never call it inline as one term of that chain. Java
+  // short-circuits ||, so an earlier term in the chain matching the same entry (e.g.
+  // deletePaths/deleteFiles/dropPartitions) would skip this call, and skip its survivor-seen
+  // side effect, even though the entry IS the survivor. See both call sites below for the
+  // pattern to follow.
+  /**
+   * AFFIRM: rejects a commit that both designates a survivor for a path AND separately asks for
+   * that same path to be deleted outright.
+   *
+   * <p>Those two instructions contradict each other, and without this check the contradiction
+   * resolves silently in the destructive direction: the survivor entry is visited (so {@link
+   * #duplicateRegistrationSurvivorsSeen} records it and {@link
+   * #validateDuplicateRegistrationSurvivorsPresent} is satisfied), but is then dropped anyway by
+   * the {@code deletePaths}/{@code deleteFiles} term in the same predicate. Every live registration
+   * of the path disappears and the commit reports success -- exactly the silent-loss shape the
+   * survivor check exists to prevent, arrived at from the other direction.
+   *
+   * <p>Not covered: {@code dropPartitions}. Deciding whether a dropped partition contains a
+   * duplicated path needs the partition tuple for that path, which is only available once the
+   * manifests are open -- by which point the filtering decision has already been made. No caller
+   * combines the two today ({@link DuplicateRegistrationRepair} sets neither), and doing so would
+   * hit the silent path described above. Left as a known gap rather than a half-check.
+   */
+  // CollectionUndefinedEquality: deletePaths is a CharSequenceSet, which wraps its elements for
+  // comparison, so a String lookup is well-defined here. Same suppression and reason as
+  // validateRequiredDeletes and the two filtering methods below.
+  @SuppressWarnings("CollectionUndefinedEquality")
+  private void validateNoContradictoryDuplicateRegistrationIntent() {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return;
+    }
+
+    Set<String> conflicting = Sets.newTreeSet();
+    for (String path : duplicateRegistrationKeepSequence.keySet()) {
+      if (deletePaths.contains(path)) {
+        conflicting.add(path);
+      }
+    }
+    for (String path : callerDeletedFilePaths) {
+      if (duplicateRegistrationKeepSequence.containsKey(path)) {
+        conflicting.add(path);
+      }
+    }
+
+    ValidationException.check(
+        conflicting.isEmpty(),
+        "Cannot both keep a duplicate registration and delete the same path outright: %s. "
+            + "These instructions contradict each other -- the designated survivor would be "
+            + "dropped by the explicit delete, leaving no live registration of the path at all. "
+            + "Issue the repair and the delete as separate commits if both are genuinely "
+            + "intended.",
+        COMMA.join(conflicting));
+  }
+
   boolean containsDeletes() {
     return !deletePaths.isEmpty()
         || !deleteFiles.isEmpty()
         || deleteExpression != Expressions.alwaysFalse()
-        || !dropPartitions.isEmpty();
+        || !dropPartitions.isEmpty()
+        || !duplicateRegistrationKeepSequence.isEmpty();
   }
 
   /**
@@ -193,8 +333,19 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
    * @return an array of filtered manifests
    */
   List<ManifestFile> filterManifests(Schema tableSchema, List<ManifestFile> manifests) {
+    // AFFIRM: cleared per call, not per commit attempt -- apply()/filterManifests() re-runs on
+    // every optimistic-concurrency retry against a freshly refreshed base, and a survivor seen
+    // during a PRIOR (failed/superseded) attempt must never satisfy this retry's check.
+    duplicateRegistrationSurvivorsSeen.clear();
+
+    // AFFIRM: must run BEFORE the filtering loop below, which itself adds entries to
+    // deleteFiles (see filterManifestWithDeletedFiles); at this point deleteFiles still holds
+    // only what the caller supplied.
+    validateNoContradictoryDuplicateRegistrationIntent();
+
     if (manifests == null || manifests.isEmpty()) {
       validateRequiredDeletes();
+      validateDuplicateRegistrationSurvivorsPresent();
       return ImmutableList.of();
     }
 
@@ -213,8 +364,79 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
             });
 
     validateRequiredDeletes(filtered);
+    validateDuplicateRegistrationSurvivorsPresent();
 
     return Arrays.asList(filtered);
+  }
+
+  /**
+   * AFFIRM: throws if the intended surviving registration for any duplicated path was not actually
+   * observed live while filtering manifests for this attempt.
+   *
+   * <p>{@code dropDuplicateRegistrations}'s keep-sequence-number map is computed once, before this
+   * repair's commit is attempted, from a scan that already happened. {@code
+   * MergingSnapshotProducer}'s optimistic-concurrency retry loop re-runs {@code validate()}/{@code
+   * apply()} -- and therefore this filtering pass -- against a freshly refreshed base on every CAS
+   * conflict, but does NOT recompute that map. If a concurrent commit changed this exact path in
+   * the narrow window between the original scan and a retry (for example, a different operation
+   * legitimately replaced the file the "keep" sequence number pointed at), silently proceeding
+   * would drop every live registration of that path -- the survivor because it no longer exists at
+   * that sequence number, and every other registration because it doesn't match either. That is
+   * silent data loss with the commit reporting success. Failing loudly here instead means the whole
+   * commit attempt aborts; a subsequent retry (or a fresh invocation of the guard) re-evaluates
+   * against the latest state rather than acting on stale intent.
+   *
+   * <p><b>What does NOT trigger this: a concurrent streaming writer, however frequent -- including
+   * an UPSERT writer.</b> This matters because our CDC tables are fed by a Flink upsert sink that
+   * commits every ~5 minutes and emits an equality delete for every row, so "every commit touches
+   * the delete side" is the steady state here, not an edge case. It is still safe, and the reason
+   * is structural rather than a property of appends:
+   *
+   * <ul>
+   *   <li>An upsert commits a {@code RowDelta} that only calls {@code addRows}/{@code addDeletes}
+   *       -- never {@code removeRows}/{@code removeDeletes}. So {@code deletePaths}, {@code
+   *       deleteFiles} and {@code dropPartitions} all stay EMPTY on that commit.
+   *   <li>With all three empty and no delete expression, {@code canContainDeletedFiles} returns
+   *       false for every pre-existing manifest, so those manifests are never opened or rewritten
+   *       and no existing entry can be marked DELETED.
+   *   <li>Even when a commit does merge manifests, {@link ManifestWriter#existing} is contractually
+   *       required to preserve the original data sequence number, so a survivor stays findable at
+   *       exactly the sequence number the scan designated.
+   * </ul>
+   *
+   * <p>Nor does a long-running compaction widen the window: the repair is a separate metadata-only
+   * commit that lands BEFORE the rewrite is planned, so the rewrite's own duration is irrelevant
+   * here. Only an operation that explicitly removes or replaces that exact entry can trigger this:
+   * another compaction, a DELETE/MERGE/overwrite touching that file, a dedup or privacy-delete job,
+   * or another repair. None of those run on the streaming writer's cadence.
+   *
+   * <p><b>Known, accepted tradeoff:</b> this fails the ENTIRE batch's commit if even one duplicated
+   * path's survivor goes missing, even when every other path in the batch is still perfectly
+   * repairable. Deliberately not implemented as "drop the poisoned path and repair the rest": that
+   * would mean silently mutating repair intent baked into an EARLIER scan under exactly the
+   * CAS-conflict conditions this method exists to be paranoid about, which is a much larger
+   * correctness surface than the fail-and-let-a-fresh-run-rescan behavior chosen here. The whole-
+   * batch failure is self-healing provided the interfering operation is not itself recurring: the
+   * next scheduled compaction run re-scans and repairs whatever is still actually duplicated.
+   */
+  private void validateDuplicateRegistrationSurvivorsPresent() {
+    if (duplicateRegistrationKeepSequence.isEmpty()) {
+      return;
+    }
+
+    Set<String> missing =
+        Sets.difference(
+                duplicateRegistrationKeepSequence.keySet(), duplicateRegistrationSurvivorsSeen)
+            .immutableCopy();
+    ValidationException.check(
+        missing.isEmpty(),
+        "Cannot repair duplicate file registrations: the intended surviving registration was "
+            + "not found live for %d path(s), most likely because a concurrent commit already "
+            + "changed them since this repair's scan. Aborting this commit attempt rather than "
+            + "risking dropping every live registration of an affected path. A retry will "
+            + "re-evaluate against the latest state. Affected: %s",
+        missing.size(),
+        COMMA.join(missing));
   }
 
   // Use the current set of referenced manifests as a source of truth when it's a subset of all
@@ -400,9 +622,19 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
   }
 
   private boolean canContainDroppedFiles(ManifestFile manifest) {
-    if (!deletePaths.isEmpty()) {
+    // AFFIRM: independent checks, not an else-if chain. deleteFiles/deletePaths and
+    // duplicateRegistrationKeepSequence can in principle both be populated on the same
+    // ManifestFilterManager instance (they're independent predicates on the same class); an
+    // else-if here would let a deleteFiles partition-overlap check short-circuit past a real
+    // duplicate registration in a manifest outside that partition set, silently under-scanning.
+    if (!deletePaths.isEmpty() || !duplicateRegistrationKeepSequence.isEmpty()) {
+      // AFFIRM: no cheap partition/path pre-filter is available for a duplicate registration --
+      // it can be in any manifest of either content type -- so every manifest must be opened.
+      // This repair path is rare by construction, so the extra scan cost is acceptable.
       return true;
-    } else if (!deleteFiles.isEmpty()) {
+    }
+
+    if (!deleteFiles.isEmpty()) {
       return ManifestFileUtil.canContainAny(manifest, deleteFilePartitions, specsById);
     }
 
@@ -420,10 +652,17 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
 
     for (ManifestEntry<F> entry : reader.liveEntries()) {
       F file = entry.file();
+      // AFFIRM: evaluated unconditionally, not inline in the || chain below. This method's
+      // "mark the survivor as seen" side effect only fires when this call is actually reached;
+      // placing it after an earlier condition in a || chain would let Java's short-circuiting
+      // skip it whenever that earlier condition already matched the same entry, wrongly leaving
+      // a live survivor unrecorded.
+      boolean isDuplicateRegistrationDrop = isDuplicateRegistrationToDrop(file, entry);
       boolean markedForDelete =
           deletePaths.contains(file.location())
               || deleteFiles.contains(file)
               || dropPartitions.contains(file.specId(), file.partition())
+              || isDuplicateRegistrationDrop
               || (isDelete
                   && entry.isLive()
                   && entry.dataSequenceNumber() > 0
@@ -468,10 +707,14 @@ abstract class ManifestFilterManager<F extends ContentFile<F>> {
             .forEach(
                 entry -> {
                   F file = entry.file();
+                  // AFFIRM: evaluated unconditionally -- see the identical note at the other
+                  // call site in manifestHasDeletedFiles above.
+                  boolean isDuplicateRegistrationDrop = isDuplicateRegistrationToDrop(file, entry);
                   boolean markedForDelete =
                       deletePaths.contains(file.location())
                           || deleteFiles.contains(file)
                           || dropPartitions.contains(file.specId(), file.partition())
+                          || isDuplicateRegistrationDrop
                           || (isDelete
                               && entry.isLive()
                               && entry.dataSequenceNumber() > 0
