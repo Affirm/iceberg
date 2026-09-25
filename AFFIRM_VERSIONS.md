@@ -8,6 +8,16 @@ Format: one section per published version, listing its upstream base and every A
 carried on top, each linked to its upstream reference where one exists. The git tag for a version
 is the source of truth for the commit published to Artifactory.
 
+## 1.11.0-affirm-patch.2
+
+- **Base:** `1.11.0-affirm-patch.1`
+
+| Fork PR | Upstream reference | Scope |
+|---|---|---|
+| [Affirm/iceberg#12](https://github.com/Affirm/iceberg/pull/12) | apache/iceberg#17194, apache/iceberg#17212 | Fix microsecond-timestamp sub-ms-remainder crash in `AvroToRowDataConverters`; backported to `flink/v2.1`, `flink/v2.0`, `flink/v1.20` |
+| [Affirm/iceberg#13](https://github.com/Affirm/iceberg/pull/13) | apache/iceberg#18101, apache/iceberg#18196 | Preserve `RowKind` in `DynamicIcebergSink`'s `DataConverter` instead of defaulting schema-mismatch row rebuilds to `INSERT`; backported to `flink/v2.1`, `flink/v2.0`, `flink/v1.20` |
+| [Affirm/iceberg#14](https://github.com/Affirm/iceberg/pull/14) | apache/iceberg#17437, apache/iceberg#17590 | Reuse loaded `Catalog` in `TableSerializerCache` instead of reloading (and leaking a REST HTTP client) on every schema-evolution cache miss; backported to `flink/v2.1`, `flink/v2.0`, `flink/v1.20` |
+
 ## 1.11.0-affirm-patch.1
 
 - **Base:** `apache-iceberg-1.11.0`
