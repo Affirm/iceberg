@@ -1,1 +1,1 @@
-1.11.0-affirm-patch.1
+1.11.0-affirm-patch.2
