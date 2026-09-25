@@ -14,8 +14,6 @@ is the source of truth for the commit published to Artifactory.
 
 | Fork PR | Upstream reference | Scope |
 |---|---|---|
-| [Affirm/iceberg#10](https://github.com/Affirm/iceberg/pull/10) | apache/iceberg#16011, apache/iceberg#16648 | Fix duplicate commits in `DynamicCommitter` when the Flink jobId changes on restart (e.g. stop-with-savepoint, autoscaler resubmit); backported to `flink/v2.1`, `flink/v2.0`, `flink/v1.20` |
-| [Affirm/iceberg#11](https://github.com/Affirm/iceberg/pull/11) | apache/iceberg#18071 | Fix CI by pulling MinIO test containers from Quay instead of Docker Hub, avoiding Docker Hub pull failures |
 | [Affirm/iceberg#12](https://github.com/Affirm/iceberg/pull/12) | apache/iceberg#17194, apache/iceberg#17212 | Fix microsecond-timestamp sub-ms-remainder crash in `AvroToRowDataConverters`; backported to `flink/v2.1`, `flink/v2.0`, `flink/v1.20` |
 | [Affirm/iceberg#13](https://github.com/Affirm/iceberg/pull/13) | apache/iceberg#18101, apache/iceberg#18196 | Preserve `RowKind` in `DynamicIcebergSink`'s `DataConverter` instead of defaulting schema-mismatch row rebuilds to `INSERT`; backported to `flink/v2.1`, `flink/v2.0`, `flink/v1.20` |
 | [Affirm/iceberg#14](https://github.com/Affirm/iceberg/pull/14) | apache/iceberg#17437, apache/iceberg#17590 | Reuse loaded `Catalog` in `TableSerializerCache` instead of reloading (and leaking a REST HTTP client) on every schema-evolution cache miss; backported to `flink/v2.1`, `flink/v2.0`, `flink/v1.20` |
