@@ -22,20 +22,16 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.BiFunction;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.StructLike;
-import org.apache.iceberg.io.BaseTaskWriter;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.FileWriterFactory;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.Tasks;
 
 class PartitionedDeltaWriter extends BaseDeltaTaskWriter {
@@ -55,9 +51,7 @@ class PartitionedDeltaWriter extends BaseDeltaTaskWriter {
       RowType flinkSchema,
       Set<Integer> equalityFieldIds,
       boolean upsert,
-      boolean useDv,
-      BiFunction<StructLike, Types.StructType, BaseTaskWriter.InsertedRowTracker>
-          insertedRowTrackers) {
+      boolean useDv) {
     super(
         spec,
         format,
@@ -69,8 +63,7 @@ class PartitionedDeltaWriter extends BaseDeltaTaskWriter {
         flinkSchema,
         equalityFieldIds,
         upsert,
-        useDv,
-        insertedRowTrackers);
+        useDv);
     this.partitionKey = new PartitionKey(spec, schema);
   }
 
