@@ -36,7 +36,7 @@ The jar ships only inside the Affirm pyspark wheel (`Affirm/spark@affirm-3.5.4`,
 ## 1.8.1-PATCH.1
 
 - **Base:** `apache-iceberg-1.8.1`
-- **Commit:** `1d358d27778a` (merge of #1). Shipped in pyspark `2815!3.5.4+affirm.5`.
+- **Commit:** `1d358d27778a` (merge of #1). First shipped in pyspark `2815!3.5.4+affirm.4`; also in `+affirm.5`.
 
 | Fork PR | Upstream reference | Scope |
 |---|---|---|
