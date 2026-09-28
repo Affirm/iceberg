@@ -19,6 +19,7 @@
 package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.io.IOException;
@@ -53,6 +54,7 @@ import org.apache.iceberg.data.orc.GenericOrcReader;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.deletes.DeleteGranularity;
 import org.apache.iceberg.deletes.PositionDeleteIndex;
+import org.apache.iceberg.io.BaseTaskWriter.InsertedRowTracker;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -547,6 +549,95 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
     return set;
   }
 
+  @TestTemplate
+  public void testSharedInsertedRowTrackerAcrossWriters() throws IOException {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId);
+    Schema deleteSchema = table.schema().select("id");
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(deleteSchema.asStruct());
+    GenericRecord keyRecord = GenericRecord.create(deleteSchema);
+
+    // Two writers of the same table within one commit, as a sink opens when the table schema
+    // evolves mid-commit. Every file they produce lands at the same sequence number, so only
+    // position deletes can retire rows they wrote for each other.
+    GenericTaskDeltaWriter first =
+        createTaskWriter(
+            equalityFieldIds, deleteSchema, DeleteGranularity.FILE, sharedInsertedRows);
+    GenericTaskDeltaWriter second =
+        createTaskWriter(
+            equalityFieldIds, deleteSchema, DeleteGranularity.FILE, sharedInsertedRows);
+
+    first.write(createRecord(1, "aaa"));
+    first.write(createRecord(2, "bbb"));
+
+    // upsert of key 1 through the second writer retires the row the first writer wrote
+    second.deleteKey(keyRecord.copy("id", 1));
+    second.write(createRecord(1, "ccc"));
+
+    // upsert of key 1 back through the first writer retires the second writer's row
+    first.deleteKey(keyRecord.copy("id", 1));
+    first.write(createRecord(1, "ddd"));
+
+    WriteResult firstResult = first.complete();
+    WriteResult secondResult = second.complete();
+
+    assertThat(firstResult.dataFiles()).hasSize(1);
+    assertThat(secondResult.dataFiles()).hasSize(1);
+    DataFile firstDataFile = firstResult.dataFiles()[0];
+    DataFile secondDataFile = secondResult.dataFiles()[0];
+
+    assertThat(secondResult.deleteFiles())
+        .as("Second writer should retire the first writer's row with a position delete")
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(secondResult.referencedDataFiles()).containsExactly(firstDataFile.location());
+
+    assertThat(firstResult.deleteFiles())
+        .as("First writer should retire the second writer's row with a position delete")
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(firstResult.referencedDataFiles()).containsExactly(secondDataFile.location());
+
+    // closing a writer must not clear the shared tracker: a third writer still finds key 2
+    GenericTaskDeltaWriter third =
+        createTaskWriter(
+            equalityFieldIds, deleteSchema, DeleteGranularity.FILE, sharedInsertedRows);
+    third.deleteKey(keyRecord.copy("id", 2));
+    WriteResult thirdResult = third.complete();
+    assertThat(thirdResult.dataFiles()).isEmpty();
+    assertThat(thirdResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(thirdResult.referencedDataFiles()).containsExactly(firstDataFile.location());
+
+    RowDelta rowDelta = table.newRowDelta();
+    for (WriteResult result : ImmutableList.of(firstResult, secondResult, thirdResult)) {
+      Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
+      Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
+    }
+
+    rowDelta.commit();
+
+    assertThat(actualRowSet("*"))
+        .as("Only the last write of key 1 should survive; key 2 should be deleted")
+        .isEqualTo(expectedRowSet(ImmutableList.of(createRecord(1, "ddd"))));
+  }
+
+  @TestTemplate
+  public void testSharedInsertedRowTrackerRejectsMismatchedKeyType() {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId);
+    Schema deleteSchema = table.schema().select("id");
+    InsertedRowTracker dataKeyedTracker =
+        InsertedRowTracker.create(table.schema().select("data").asStruct());
+
+    assertThatThrownBy(
+            () ->
+                createTaskWriter(
+                    equalityFieldIds, deleteSchema, DeleteGranularity.FILE, dataKeyedTracker))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Shared inserted-row tracker key type")
+        .hasMessageContaining("must match equality-delete schema");
+  }
+
   /**
    * Create a generic task equality delta writer.
    *
@@ -558,6 +649,14 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
       List<Integer> equalityFieldIds,
       Schema eqDeleteRowSchema,
       DeleteGranularity deleteGranularity) {
+    return createTaskWriter(equalityFieldIds, eqDeleteRowSchema, deleteGranularity, null);
+  }
+
+  private GenericTaskDeltaWriter createTaskWriter(
+      List<Integer> equalityFieldIds,
+      Schema eqDeleteRowSchema,
+      DeleteGranularity deleteGranularity,
+      InsertedRowTracker sharedInsertedRows) {
     FileWriterFactory<Record> fileWriterFactory =
         new GenericFileWriterFactory.Builder(table)
             .dataFileFormat(format)
@@ -581,7 +680,8 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         table.io(),
         TARGET_FILE_SIZE,
         deleteGranularity,
-        formatVersion > 2);
+        formatVersion > 2,
+        sharedInsertedRows);
   }
 
   private static class GenericTaskDeltaWriter extends BaseTaskWriter<Record> {
@@ -597,11 +697,12 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         FileIO io,
         long targetFileSize,
         DeleteGranularity deleteGranularity,
-        boolean useDv) {
+        boolean useDv,
+        InsertedRowTracker sharedInsertedRows) {
       super(spec, format, fileWriterFactory, fileFactory, io, targetFileSize, useDv);
       this.deltaWriter =
           new GenericEqualityDeltaWriter(
-              null, schema, deleteSchema, deleteGranularity, dvFileWriter());
+              null, schema, deleteSchema, deleteGranularity, dvFileWriter(), sharedInsertedRows);
     }
 
     @Override
@@ -630,8 +731,9 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
           Schema schema,
           Schema eqDeleteSchema,
           DeleteGranularity deleteGranularity,
-          PartitioningDVWriter<Record> dvWriter) {
-        super(partition, schema, eqDeleteSchema, deleteGranularity, dvWriter);
+          PartitioningDVWriter<Record> dvWriter,
+          InsertedRowTracker sharedInsertedRows) {
+        super(partition, schema, eqDeleteSchema, deleteGranularity, dvWriter, sharedInsertedRows);
       }
 
       @Override
