@@ -20,7 +20,7 @@ The jar ships only inside the Affirm pyspark wheel (`Affirm/spark@affirm-3.5.4`,
 
 | Fork PR | Upstream reference | Scope |
 |---|---|---|
-| Affirm/iceberg#TBD | apache/iceberg#12855 (fixes apache/iceberg#11239) | Deep-copy `ByteBuffer` and nested `GenericRecord` values in `GenericRecord.copy()`, so equality deletes on a binary key are no longer collapsed to the last record of each delete file (LAKE-7013) |
+| [Affirm/iceberg#16](https://github.com/Affirm/iceberg/pull/16) | apache/iceberg#12855 (fixes apache/iceberg#11239) | Deep-copy `ByteBuffer` and nested `GenericRecord` values in `GenericRecord.copy()`, so equality deletes on a binary key are no longer collapsed to the last record of each delete file (LAKE-7013) |
 
 ## 1.8.1-PATCH.3
 
