@@ -182,7 +182,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
    * delete cannot do that, because it only applies to data files with a strictly lower data
    * sequence number than its own, and every file in one commit shares a sequence number.
    *
-   * <p>A tracker may be shared by several {@link BaseEqualityDeltaWriter}s that write the same
+   * <p>A tracker may be shared by several {@code BaseEqualityDeltaWriter}s that write the same
    * table within one commit, for example when a schema evolution makes a sink open a second writer
    * mid-commit. A shared tracker lives as long as the commit it belongs to; the sink that created
    * it drops it at commit time, and a writer only clears a tracker it created itself.
