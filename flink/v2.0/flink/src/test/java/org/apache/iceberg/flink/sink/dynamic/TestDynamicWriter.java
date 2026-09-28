@@ -33,6 +33,7 @@ import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
+import org.apache.flink.types.RowKind;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
@@ -44,6 +45,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.common.DynFields;
+import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.RegistryBasedFileWriterFactory;
 import org.apache.iceberg.flink.FlinkWriteOptions;
@@ -496,10 +498,78 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     assertThat(results).hasSize(2);
     assertThat(dataFiles(results)).hasSize(2);
     assertThat(deleteFiles(results))
-        .noneMatch(file -> file.content() == FileContent.POSITION_DELETES);
+        .as("Each writer emits its own insert-time equality delete and no position delete")
+        .hasSize(2)
+        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
 
     commit(table, results);
-    assertThat(SimpleDataUtil.tableRecords(table)).hasSize(2);
+    Record before = GenericRecord.create(table.schema());
+    before.setField("id", 1L);
+    before.setField("data", "before");
+    Record after = GenericRecord.create(table.schema());
+    after.setField("id", 1L);
+    after.setField("data", "after");
+    assertTableRows(table, before, after);
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertOfSameKeyAcrossColumnDocChangeWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    Schema schemaBefore = table.schema();
+    dynamicWriter.write(
+        upsertRecord(table, schemaBefore, SimpleDataUtil.createRowData(1, "before")), null);
+
+    // The sink evolves column docs on its own; a doc change on the key column must not stop the
+    // writers from sharing a tracker, since key values compare by type, not by name or doc.
+    table.updateSchema().updateColumnDoc("id", "primary key").commit();
+    Schema schemaAfter = table.schema();
+    assertThat(schemaAfter.schemaId()).isNotEqualTo(schemaBefore.schemaId());
+    dynamicWriter.write(
+        upsertRecord(table, schemaAfter, SimpleDataUtil.createRowData(1, "after")), null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(results).hasSize(2);
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .hasSize(1);
+
+    commit(table, results);
+    assertTableRows(table, SimpleDataUtil.createRecord(1, "after"));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testDeleteThroughSecondWriterWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    Schema schemaBefore = table.schema();
+    dynamicWriter.write(
+        upsertRecord(table, schemaBefore, SimpleDataUtil.createRowData(1, "before")), null);
+
+    table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
+    Schema schemaAfter = table.schema();
+    RowData delete =
+        GenericRowData.ofKind(
+            RowKind.DELETE, 1, StringData.fromString("before"), StringData.fromString("x"));
+    dynamicWriter.write(upsertRecord(table, schemaAfter, delete), null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(results).hasSize(2);
+    assertThat(dataFiles(results)).as("The delete writer produces no data file").hasSize(1);
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .hasSize(1);
+
+    commit(table, results);
+    assertTableRows(table);
 
     dynamicWriter.close();
   }

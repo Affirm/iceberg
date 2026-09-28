@@ -57,7 +57,9 @@ public class RowDataTaskWriterFactory implements TaskWriterFactory<RowData> {
   private final Set<Integer> equalityFieldIds;
   private final boolean upsert;
   private final FileWriterFactory<RowData> fileWriterFactory;
-  private final BiFunction<StructLike, Types.StructType, BaseTaskWriter.InsertedRowTracker>
+  // Not serialized: only sinks that build the factory on the task manager can share trackers.
+  private final transient BiFunction<
+          StructLike, Types.StructType, BaseTaskWriter.InsertedRowTracker>
       insertedRowTrackers;
   private boolean useDv;
 

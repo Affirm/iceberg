@@ -184,8 +184,8 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
    *
    * <p>A tracker may be shared by several {@link BaseEqualityDeltaWriter}s that write the same
    * table within one commit, for example when a schema evolution makes a sink open a second writer
-   * mid-commit. The owner of a shared tracker is responsible for clearing it at commit time; a
-   * writer only clears a tracker it created itself.
+   * mid-commit. A shared tracker lives as long as the commit it belongs to; the sink that created
+   * it drops it at commit time, and a writer only clears a tracker it created itself.
    */
   public static class InsertedRowTracker {
     private final Types.StructType keyType;
@@ -206,11 +206,39 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
       return new InsertedRowTracker(keyType);
     }
 
+    /** Returns the struct type of the equality fields this tracker is keyed by. */
     public Types.StructType keyType() {
       return keyType;
     }
 
-    public void clear() {
+    /**
+     * Returns whether keys of the given struct type can be stored and looked up in this tracker.
+     *
+     * <p>Keys are compared by position, type and optionality, which is what {@link StructLikeMap}
+     * uses; field names, docs and defaults may differ. Field IDs must match so that the two key
+     * types describe the same equality fields.
+     */
+    public boolean acceptsKeyType(Types.StructType otherKeyType) {
+      List<Types.NestedField> fields = keyType.fields();
+      List<Types.NestedField> otherFields = otherKeyType.fields();
+      if (fields.size() != otherFields.size()) {
+        return false;
+      }
+
+      for (int pos = 0; pos < fields.size(); pos += 1) {
+        Types.NestedField field = fields.get(pos);
+        Types.NestedField otherField = otherFields.get(pos);
+        if (field.fieldId() != otherField.fieldId()
+            || field.isOptional() != otherField.isOptional()
+            || !field.type().equals(otherField.type())) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    private void clear() {
       offsetsByKey.clear();
     }
 
@@ -260,8 +288,8 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
      * Creates an equality delta writer that records inserted rows in a shared tracker.
      *
      * @param sharedInsertedRows a tracker shared with other writers of the same table within the
-     *     current commit, or null to use a private tracker. Its key type must equal the
-     *     equality-delete schema's struct type.
+     *     current commit, or null to use a private tracker. It must accept the equality-delete
+     *     schema's struct type as key type, see {@link InsertedRowTracker#acceptsKeyType}.
      */
     protected BaseEqualityDeltaWriter(
         StructLike partition,
@@ -273,8 +301,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
       Preconditions.checkNotNull(schema, "Iceberg table schema cannot be null.");
       Preconditions.checkNotNull(deleteSchema, "Equality-delete schema cannot be null.");
       Preconditions.checkArgument(
-          sharedInsertedRows == null
-              || sharedInsertedRows.keyType().equals(deleteSchema.asStruct()),
+          sharedInsertedRows == null || sharedInsertedRows.acceptsKeyType(deleteSchema.asStruct()),
           "Shared inserted-row tracker key type %s must match equality-delete schema %s",
           sharedInsertedRows != null ? sharedInsertedRows.keyType() : null,
           deleteSchema.asStruct());

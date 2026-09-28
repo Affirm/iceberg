@@ -120,9 +120,9 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<RowData> {
 
     Types.StructType keyType = deleteSchema.asStruct();
     InsertedRowTracker tracker = insertedRowTrackers.apply(partition, keyType);
-    if (tracker != null && !tracker.keyType().equals(keyType)) {
+    if (tracker != null && !tracker.acceptsKeyType(keyType)) {
       LOG.warn(
-          "Not sharing inserted-row tracker for partition {}: its key type {} does not match "
+          "Not sharing inserted-row tracker for partition {}: its key type {} does not accept "
               + "equality-delete schema {}. Re-writes of a key across these schema versions within "
               + "one checkpoint will produce equality deletes that cannot apply to data written in "
               + "the same commit",

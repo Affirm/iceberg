@@ -62,11 +62,11 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
   private final Map<WriteTarget, RowDataTaskWriterFactory> taskWriterFactories;
   private final Map<WriteTarget, TaskWriter<RowData>> writers;
   // Inserted-row trackers shared by all writers of one table (key: WriteTarget without schema ID)
-  // within the current checkpoint, per partition. A schema evolution mid-checkpoint opens a second
-  // writer for the same table; without a shared tracker its re-writes of keys already written by
-  // the first writer would produce equality deletes at the same sequence number as their targets,
-  // which never apply.
-  private final Map<WriteTarget, Map<StructLike, InsertedRowTracker>> insertedRowTrackers;
+  // within the current checkpoint. A schema evolution mid-checkpoint opens another writer for the
+  // same table; without a shared tracker its re-writes of keys already written by the earlier
+  // writer would produce equality deletes at the same sequence number as their targets, which
+  // never apply.
+  private final Map<WriteTarget, TableTrackers> insertedRowTrackers;
   private final Configuration flinkConfig;
   private final Map<String, String> commonWriteProperties;
   private final DynamicWriterMetrics metrics;
@@ -168,9 +168,23 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
 
   private InsertedRowTracker insertedRowTracker(
       WriteTarget trackerScope, StructLike partition, Types.StructType keyType) {
-    return insertedRowTrackers
-        .computeIfAbsent(trackerScope, scope -> Maps.newHashMap())
-        .computeIfAbsent(partition, part -> InsertedRowTracker.create(keyType));
+    TableTrackers trackers =
+        insertedRowTrackers.computeIfAbsent(trackerScope, scope -> new TableTrackers(keyType));
+    if (!trackers.acceptsKeyType(keyType)) {
+      LOG.warn(
+          "Not sharing inserted-row tracker for table {} branch {}: key type {} of the earlier "
+              + "writers does not accept key type {} of the new writer (equality-field type "
+              + "promotion or rename). Re-writes of a key across these schema versions within one "
+              + "checkpoint will produce equality deletes that cannot apply to data written in the "
+              + "same commit",
+          trackerScope.tableName(),
+          trackerScope.branch(),
+          trackers.keyType(),
+          keyType);
+      return null;
+    }
+
+    return trackers.forPartition(partition);
   }
 
   private void warnIfSplitsTable(WriteTarget newTarget) {
@@ -178,10 +192,9 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
     for (WriteTarget existing : writers.keySet()) {
       if (existing.withoutSchemaId().equals(scope)) {
         LOG.warn(
-            "Opening a second writer for table {} branch {} within one checkpoint: schema ID {} -> {}, "
-                + "spec ID {}, subtask {}, attempt {}. Writers of this table share an inserted-row "
-                + "tracker so that re-writes of a key across the schema change are retired with "
-                + "position deletes",
+            "Opening another writer for table {} branch {} within one checkpoint: schema ID {} -> {}, "
+                + "spec ID {}, subtask {}, attempt {}. Re-writes of a key across the schema change "
+                + "are retired with position deletes while the writers share an inserted-row tracker",
             newTarget.tableName(),
             newTarget.branch(),
             existing.schemaId(),
@@ -193,6 +206,29 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
     }
   }
 
+  /** Inserted-row trackers of one table within one checkpoint, one per partition. */
+  private static class TableTrackers {
+    private final Types.StructType keyType;
+    private final Map<StructLike, InsertedRowTracker> byPartition = Maps.newHashMap();
+
+    private TableTrackers(Types.StructType keyType) {
+      this.keyType = keyType;
+    }
+
+    private Types.StructType keyType() {
+      return keyType;
+    }
+
+    private boolean acceptsKeyType(Types.StructType otherKeyType) {
+      return byPartition.isEmpty()
+          || byPartition.values().iterator().next().acceptsKeyType(otherKeyType);
+    }
+
+    private InsertedRowTracker forPartition(StructLike partition) {
+      return byPartition.computeIfAbsent(partition, part -> InsertedRowTracker.create(keyType));
+    }
+  }
+
   @Override
   public void flush(boolean endOfInput) {
     // flush is used to handle flush/endOfInput, so no action is taken here.
@@ -200,11 +236,13 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
 
   @Override
   public void close() throws Exception {
-    for (TaskWriter<RowData> writer : writers.values()) {
-      writer.close();
+    try {
+      for (TaskWriter<RowData> writer : writers.values()) {
+        writer.close();
+      }
+    } finally {
+      insertedRowTrackers.clear();
     }
-
-    insertedRowTrackers.clear();
   }
 
   @Override

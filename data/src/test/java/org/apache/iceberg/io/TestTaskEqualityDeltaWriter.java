@@ -60,6 +60,7 @@ import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ArrayUtil;
 import org.apache.iceberg.util.StructLikeSet;
 import org.junit.jupiter.api.BeforeEach;
@@ -620,6 +621,32 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
     assertThat(actualRowSet("*"))
         .as("Only the last write of key 1 should survive; key 2 should be deleted")
         .isEqualTo(expectedRowSet(ImmutableList.of(createRecord(1, "ddd"))));
+  }
+
+  @TestTemplate
+  public void testSharedInsertedRowTrackerAcceptsRenamedKeyField() throws IOException {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId);
+    Schema deleteSchema = table.schema().select("id");
+    Types.StructType renamedKeyType =
+        Types.StructType.of(
+            Types.NestedField.from(table.schema().findField(idFieldId))
+                .withName("renamed_id")
+                .withDoc("doc")
+                .build());
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(renamedKeyType);
+
+    assertThat(sharedInsertedRows.acceptsKeyType(deleteSchema.asStruct())).isTrue();
+
+    GenericTaskDeltaWriter writer =
+        createTaskWriter(
+            equalityFieldIds, deleteSchema, DeleteGranularity.FILE, sharedInsertedRows);
+    writer.write(createRecord(1, "aaa"));
+    writer.write(createRecord(1, "bbb"));
+    WriteResult result = writer.complete();
+
+    assertThat(result.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
   }
 
   @TestTemplate
