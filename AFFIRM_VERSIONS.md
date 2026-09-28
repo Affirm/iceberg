@@ -11,8 +11,8 @@ git tag for a version is the source of truth for the commit that was built. `PAT
 were built from untagged commits with a hand-written `version.txt`; the shas below are recorded from
 branch history.
 
-The jar ships only inside the Affirm pyspark wheel (`Affirm/spark@affirm-3.5.4`, `pom.xml`
-`${iceberg.version}-PATCH.N`). Keep the uppercase `-PATCH.N` spelling; that pom interpolates it.
+The jar ships inside Affirm's internal Spark build, which interpolates `-PATCH.N` into the artifact
+version. Keep the uppercase `-PATCH.N` spelling.
 
 ## 1.8.1-PATCH.4
 
@@ -25,7 +25,7 @@ The jar ships only inside the Affirm pyspark wheel (`Affirm/spark@affirm-3.5.4`,
 ## 1.8.1-PATCH.3
 
 - **Base:** `1.8.1-PATCH.1`
-- **Commit:** `d4406cd29194` (merge of #4). Shipped in pyspark `2815!3.5.4+affirm.6`.
+- **Commit:** `d4406cd29194` (merge of #4).
 
 | Fork PR | Upstream reference | Scope |
 |---|---|---|
@@ -36,7 +36,7 @@ The jar ships only inside the Affirm pyspark wheel (`Affirm/spark@affirm-3.5.4`,
 ## 1.8.1-PATCH.1
 
 - **Base:** `apache-iceberg-1.8.1`
-- **Commit:** `1d358d27778a` (merge of #1). First shipped in pyspark `2815!3.5.4+affirm.4`; also in `+affirm.5`.
+- **Commit:** `1d358d27778a` (merge of #1).
 
 | Fork PR | Upstream reference | Scope |
 |---|---|---|
