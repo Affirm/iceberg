@@ -665,6 +665,94 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         .hasMessageContaining("must match equality-delete schema");
   }
 
+  @TestTemplate
+  public void testSharedInsertedRowTrackerRetiresRowDeletedThroughOtherWriter() throws IOException {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId);
+    Schema deleteSchema = table.schema().select("id");
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(deleteSchema.asStruct());
+
+    GenericTaskDeltaWriter first =
+        createTaskWriter(
+            equalityFieldIds, deleteSchema, DeleteGranularity.FILE, sharedInsertedRows);
+    GenericTaskDeltaWriter second =
+        createTaskWriter(
+            equalityFieldIds, deleteSchema, DeleteGranularity.FILE, sharedInsertedRows);
+
+    first.write(createRecord(1, "aaa"));
+    first.write(createRecord(2, "bbb"));
+
+    // a row delete (CDC UPDATE_BEFORE or DELETE) through the second writer retires the row the
+    // first writer wrote with a position delete, instead of an equality delete
+    second.delete(createRecord(1, "aaa"));
+    second.write(createRecord(1, "ccc"));
+
+    WriteResult firstResult = first.complete();
+    WriteResult secondResult = second.complete();
+
+    assertThat(firstResult.deleteFiles()).isEmpty();
+    assertThat(secondResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(secondResult.referencedDataFiles())
+        .containsExactly(firstResult.dataFiles()[0].location());
+
+    RowDelta rowDelta = table.newRowDelta();
+    for (WriteResult result : ImmutableList.of(firstResult, secondResult)) {
+      Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
+      Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
+    }
+
+    rowDelta.commit();
+
+    assertThat(actualRowSet("*"))
+        .isEqualTo(
+            expectedRowSet(ImmutableList.of(createRecord(1, "ccc"), createRecord(2, "bbb"))));
+  }
+
+  @TestTemplate
+  public void testInsertedRowTrackerKeyTypeCompatibility() {
+    Types.NestedField id = table.schema().findField(idFieldId);
+    Types.StructType keyType = Types.StructType.of(id);
+    InsertedRowTracker tracker = InsertedRowTracker.create(keyType);
+
+    assertThat(tracker.keyType()).isEqualTo(keyType);
+    assertThat(tracker.acceptsKeyType(keyType)).isTrue();
+    assertThat(
+            tracker.acceptsKeyType(
+                Types.StructType.of(
+                    Types.NestedField.from(id)
+                        .withName("renamed")
+                        .withDoc("doc")
+                        .withWriteDefault(7)
+                        .build())))
+        .as("Names, docs and defaults do not affect how keys compare")
+        .isTrue();
+    assertThat(
+            tracker.acceptsKeyType(
+                Types.StructType.of(Types.NestedField.from(id).withId(id.fieldId() + 100).build())))
+        .as("A different field ID describes a different equality field")
+        .isFalse();
+    assertThat(
+            tracker.acceptsKeyType(
+                Types.StructType.of(
+                    Types.NestedField.from(id).isOptional(!id.isOptional()).build())))
+        .as("Optionality must match")
+        .isFalse();
+    assertThat(
+            tracker.acceptsKeyType(
+                Types.StructType.of(
+                    Types.NestedField.from(id).ofType(Types.LongType.get()).build())))
+        .as("A promoted key type compares differently")
+        .isFalse();
+    assertThat(tracker.acceptsKeyType(Types.StructType.of(id, table.schema().findField("data"))))
+        .as("The number of key fields must match")
+        .isFalse();
+
+    assertThatThrownBy(() -> InsertedRowTracker.create(null))
+        .isInstanceOf(NullPointerException.class)
+        .hasMessage("Inserted-row tracker key type cannot be null");
+  }
+
   /**
    * Create a generic task equality delta writer.
    *

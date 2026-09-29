@@ -27,6 +27,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
@@ -574,15 +575,166 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     dynamicWriter.close();
   }
 
+  @Test
+  void testCdcUpdateAcrossSchemaEvolutionWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    Schema schemaBefore = table.schema();
+    dynamicWriter.write(
+        cdcRecord(table, schemaBefore, SimpleDataUtil.createInsert(1, "before")), null);
+
+    // Without upsert mode an update arrives as UPDATE_BEFORE + UPDATE_AFTER. The UPDATE_BEFORE
+    // through the second writer must retire the first writer's row with a position delete.
+    table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
+    Schema schemaAfter = table.schema();
+    dynamicWriter.write(
+        cdcRecord(
+            table,
+            schemaAfter,
+            GenericRowData.ofKind(RowKind.UPDATE_BEFORE, 1, StringData.fromString("before"), null)),
+        null);
+    dynamicWriter.write(
+        cdcRecord(
+            table,
+            schemaAfter,
+            GenericRowData.ofKind(
+                RowKind.UPDATE_AFTER,
+                1,
+                StringData.fromString("after"),
+                StringData.fromString("x"))),
+        null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(results).hasSize(2);
+    assertThat(dataFiles(results)).hasSize(2);
+    assertThat(deleteFiles(results))
+        .as("The only delete is the second writer's position delete; inserts emit no delete")
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+
+    DynamicWriteResult secondWriter = resultWithDelete(results, FileContent.POSITION_DELETES);
+    DataFile firstWriterDataFile =
+        results.stream()
+            .filter(result -> result != secondWriter)
+            .findFirst()
+            .orElseThrow()
+            .writeResult()
+            .dataFiles()[0];
+    assertThat(secondWriter.writeResult().referencedDataFiles())
+        .containsExactly(firstWriterDataFile.location());
+
+    commit(table, results);
+    assertTableRows(table, SimpleDataUtil.createRecord(1, "after", "x"));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testInsertedRowTrackersDoNotOutliveCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "first")), null);
+    assertThat(insertedRowTrackers(dynamicWriter)).hasSize(1);
+
+    Collection<DynamicWriteResult> firstCheckpoint = dynamicWriter.prepareCommit();
+    assertThat(insertedRowTrackers(dynamicWriter)).isEmpty();
+    commit(table, firstCheckpoint);
+
+    // The key's row is now committed at a lower sequence number, so the next checkpoint retires it
+    // with an equality delete. A tracker surviving prepareCommit would instead emit a position
+    // delete against the previous checkpoint's data file.
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "second")), null);
+    Collection<DynamicWriteResult> secondCheckpoint = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(secondCheckpoint))
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+    assertThat(secondCheckpoint.iterator().next().writeResult().referencedDataFiles()).isEmpty();
+
+    commit(table, secondCheckpoint);
+    assertTableRows(table, SimpleDataUtil.createRecord(1, "second"));
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(2, "open")), null);
+    assertThat(insertedRowTrackers(dynamicWriter)).hasSize(1);
+    dynamicWriter.close();
+    assertThat(insertedRowTrackers(dynamicWriter)).isEmpty();
+  }
+
+  @Test
+  void testInsertedRowTrackersAreScopedPerTable() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table1 = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    Table table2 = catalog.createTable(TABLE2, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        upsertRecord(table1, table1.schema(), SimpleDataUtil.createRowData(1, "table1")), null);
+    Schema table2Before = table2.schema();
+    dynamicWriter.write(
+        upsertRecord(table2, table2Before, SimpleDataUtil.createRowData(1, "before")), null);
+
+    // Only the second table evolves; its second writer shares a tracker with its first writer,
+    // never with the other table's writer for the same key.
+    table2.updateSchema().addColumn("extra", Types.StringType.get()).commit();
+    dynamicWriter.write(upsertRecord(table2, table2.schema(), rowData(1, "after", "x")), null);
+    assertThat(insertedRowTrackers(dynamicWriter)).hasSize(2);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    Collection<DynamicWriteResult> table1Results = resultsFor(results, TABLE1);
+    Collection<DynamicWriteResult> table2Results = resultsFor(results, TABLE2);
+    assertThat(table1Results).hasSize(1);
+    assertThat(table2Results).hasSize(2);
+    assertThat(deleteFiles(table1Results))
+        .noneMatch(file -> file.content() == FileContent.POSITION_DELETES);
+
+    DynamicWriteResult table2Second = resultWithDelete(table2Results, FileContent.POSITION_DELETES);
+    DynamicWriteResult table2First = resultWithDelete(table2Results, FileContent.EQUALITY_DELETES);
+    assertThat(table2Second.writeResult().referencedDataFiles())
+        .containsExactly(table2First.writeResult().dataFiles()[0].location());
+
+    commit(table1, table1Results);
+    commit(table2, table2Results);
+    assertTableRows(table1, SimpleDataUtil.createRecord(1, "table1"));
+    assertTableRows(table2, SimpleDataUtil.createRecord(1, "after", "x"));
+
+    dynamicWriter.close();
+  }
+
   private static DynamicRecordInternal upsertRecord(Table table, Schema schema, RowData row) {
+    DynamicRecordInternal record = cdcRecord(table, schema, row);
+    record.setUpsertMode(true);
+    return record;
+  }
+
+  private static DynamicRecordInternal cdcRecord(Table table, Schema schema, RowData row) {
     DynamicRecordInternal record = new DynamicRecordInternal();
     record.setTableName(TableIdentifier.parse(table.name()).name());
     record.setSchema(schema);
     record.setSpec(table.spec());
-    record.setUpsertMode(true);
     record.setEqualityFieldIds(Sets.newHashSet(1));
     record.setRowData(row);
     return record;
+  }
+
+  private static Map<?, ?> insertedRowTrackers(DynamicWriter dynamicWriter) {
+    DynFields.BoundField<Map<?, ?>> trackersField =
+        DynFields.builder()
+            .hiddenImpl(DynamicWriter.class, "insertedRowTrackers")
+            .build(dynamicWriter);
+    return trackersField.get();
+  }
+
+  private static Collection<DynamicWriteResult> resultsFor(
+      Collection<DynamicWriteResult> results, TableIdentifier tableId) {
+    return results.stream()
+        .filter(result -> result.key().tableName().equals(tableId.name()))
+        .collect(Collectors.toList());
   }
 
   private static RowData rowData(int id, String data, String extra) {
