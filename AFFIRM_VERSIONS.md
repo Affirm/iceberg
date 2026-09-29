@@ -20,7 +20,7 @@ version. Keep the uppercase `-PATCH.N` spelling.
 
 | Fork PR | Upstream reference | Scope |
 |---|---|---|
-| [Affirm/iceberg#16](https://github.com/Affirm/iceberg/pull/16) | apache/iceberg#12855 (fixes apache/iceberg#11239) | Deep-copy `ByteBuffer` and nested `GenericRecord` values in `GenericRecord.copy()`, so equality deletes on a binary key are no longer collapsed to the last record of each delete file |
+| [Affirm/iceberg#18](https://github.com/Affirm/iceberg/pull/18) | apache/iceberg#12855 (fixes apache/iceberg#11239) | Deep-copy `ByteBuffer` and nested `GenericRecord` values in `GenericRecord.copy()`, so equality deletes on a binary key are no longer collapsed to the last record of each delete file |
 
 ## 1.8.1-PATCH.3
 
