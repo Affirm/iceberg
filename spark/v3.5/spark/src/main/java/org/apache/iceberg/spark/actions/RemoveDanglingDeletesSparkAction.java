@@ -19,7 +19,6 @@
 package org.apache.iceberg.spark.actions;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import org.apache.iceberg.DeleteFile;
@@ -35,6 +34,7 @@ import org.apache.iceberg.actions.ImmutableRemoveDanglingDeleteFiles;
 import org.apache.iceberg.actions.RemoveDanglingDeleteFiles;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.JobGroupInfo;
 import org.apache.iceberg.util.DeleteFileSet;
 import org.apache.spark.sql.SparkSession;
@@ -145,6 +145,6 @@ class RemoveDanglingDeletesSparkAction
 
     // AFFIRM: upstream uses Stream.toList(), which is Java 16+. Iceberg 1.8.1 compiles with
     // options.release = 11 (build.gradle:191), so this is a hard compile error there.
-    return new ArrayList<>(danglingDeletes);
+    return Lists.newArrayList(danglingDeletes);
   }
 }

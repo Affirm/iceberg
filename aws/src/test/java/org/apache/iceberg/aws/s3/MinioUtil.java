@@ -37,7 +37,12 @@ public class MinioUtil {
   }
 
   public static MinIOContainer createContainer(AwsCredentials credentials) {
-    var container = new MinIOContainer(DockerImageName.parse("minio/minio:latest"));
+    // MinIO no longer publishes minio/minio to Docker Hub or Quay; use Chainguard's MinIO build,
+    // which runs the same server binary.
+    var image =
+        DockerImageName.parse("cgr.dev/chainguard/minio:latest")
+            .asCompatibleSubstituteFor("minio/minio");
+    var container = new MinIOContainer(image);
 
     // this enables virtual-host-style requests. see
     // https://github.com/minio/minio/tree/master/docs/config#domain
