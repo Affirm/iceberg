@@ -197,7 +197,7 @@ public class TestExponentialHttpRequestRetryStrategy {
   }
 
   @ParameterizedTest
-  @ValueSource(ints = {429})
+  @ValueSource(ints = 429)
   public void testRetryHappensOnAcceptableStatusCodes(int statusCode) {
     BasicHttpResponse response = new BasicHttpResponse(statusCode, String.valueOf(statusCode));
     assertThat(retryStrategy.retryRequest(response, 3, null)).isTrue();
