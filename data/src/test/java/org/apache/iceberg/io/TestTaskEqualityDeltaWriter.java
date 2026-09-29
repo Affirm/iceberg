@@ -598,6 +598,9 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
     assertThat(firstResult.referencedDataFiles()).containsExactly(secondDataFile.location());
 
+    // closing a writer again is a no-op
+    first.close();
+
     // closing a writer must not clear the shared tracker: a third writer still finds key 2
     GenericTaskDeltaWriter third =
         createTaskWriter(
@@ -815,9 +818,18 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         boolean useDv,
         InsertedRowTracker sharedInsertedRows) {
       super(spec, format, fileWriterFactory, fileFactory, io, targetFileSize, useDv);
+      // without a shared tracker, use the constructor that existed before shared trackers
       this.deltaWriter =
-          new GenericEqualityDeltaWriter(
-              null, schema, deleteSchema, deleteGranularity, dvFileWriter(), sharedInsertedRows);
+          sharedInsertedRows == null
+              ? new GenericEqualityDeltaWriter(
+                  null, schema, deleteSchema, deleteGranularity, dvFileWriter())
+              : new GenericEqualityDeltaWriter(
+                  null,
+                  schema,
+                  deleteSchema,
+                  deleteGranularity,
+                  dvFileWriter(),
+                  sharedInsertedRows);
     }
 
     @Override
@@ -841,6 +853,15 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
     }
 
     private class GenericEqualityDeltaWriter extends BaseEqualityDeltaWriter {
+      private GenericEqualityDeltaWriter(
+          PartitionKey partition,
+          Schema schema,
+          Schema eqDeleteSchema,
+          DeleteGranularity deleteGranularity,
+          PartitioningDVWriter<Record> dvWriter) {
+        super(partition, schema, eqDeleteSchema, deleteGranularity, dvWriter);
+      }
+
       private GenericEqualityDeltaWriter(
           PartitionKey partition,
           Schema schema,

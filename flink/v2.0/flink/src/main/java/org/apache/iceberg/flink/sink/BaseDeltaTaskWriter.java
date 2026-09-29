@@ -55,33 +55,6 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<RowData> {
   private final boolean upsert;
   private final BiFunction<StructLike, Types.StructType, InsertedRowTracker> insertedRowTrackers;
 
-  BaseDeltaTaskWriter(
-      PartitionSpec spec,
-      FileFormat format,
-      FileWriterFactory<RowData> fileWriterFactory,
-      OutputFileFactory fileFactory,
-      FileIO io,
-      long targetFileSize,
-      Schema schema,
-      RowType flinkSchema,
-      Set<Integer> equalityFieldIds,
-      boolean upsert,
-      boolean useDv) {
-    this(
-        spec,
-        format,
-        fileWriterFactory,
-        fileFactory,
-        io,
-        targetFileSize,
-        schema,
-        flinkSchema,
-        equalityFieldIds,
-        upsert,
-        useDv,
-        null);
-  }
-
   /**
    * @param insertedRowTrackers resolves the inserted-row tracker to share for a partition (null for
    *     unpartitioned tables) and equality-key type, so that writers of the same table within one
