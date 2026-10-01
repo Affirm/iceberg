@@ -188,9 +188,8 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
   }
 
   private void warnIfSplitsTable(WriteTarget newTarget) {
-    WriteTarget scope = newTarget.withoutSchemaId();
     for (WriteTarget existing : writers.keySet()) {
-      if (existing.withoutSchemaId().equals(scope)) {
+      if (existing.sameScopeAs(newTarget)) {
         LOG.warn(
             "Opening another writer for table {} branch {} within one checkpoint: schema ID {} -> {}, "
                 + "spec ID {}, subtask {}, attempt {}. Re-writes of a key across the schema change "
