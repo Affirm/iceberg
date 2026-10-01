@@ -173,10 +173,10 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
     if (!trackers.acceptsKeyType(keyType)) {
       LOG.warn(
           "Not sharing inserted-row tracker for table {} branch {}: key type {} of the earlier "
-              + "writers does not accept key type {} of the new writer (equality-field type "
-              + "promotion or rename). Re-writes of a key across these schema versions within one "
-              + "checkpoint will produce equality deletes that cannot apply to data written in the "
-              + "same commit",
+              + "writers does not accept key type {} of the new writer (an equality field's type, "
+              + "optionality or position changed). Re-writes of a key across these schema versions "
+              + "within one checkpoint will produce equality deletes that cannot apply to data "
+              + "written in the same commit",
           trackerScope.tableName(),
           trackerScope.branch(),
           trackers.keyType(),
