@@ -510,6 +510,33 @@ public class TestDeltaTaskWriter extends TestBase {
   }
 
   @TestTemplate
+  void testTaskWriterKeepsPrivateInsertedRowTrackerWhenResolverReturnsNull() throws IOException {
+    createAndInitTable(false);
+    AtomicInteger resolverCalls = new AtomicInteger();
+    RowDataTaskWriterFactory taskWriterFactory =
+        createTaskWriterFactory(
+            Sets.newHashSet(idFieldId()),
+            (partition, keyType) -> {
+              resolverCalls.incrementAndGet();
+              return null;
+            });
+    taskWriterFactory.initialize(1, 1);
+
+    TaskWriter<RowData> writer = taskWriterFactory.create();
+    writer.write(createInsert(1, "aaa"));
+    writer.write(createDelete(1, "aaa")); // 1 pos-delete from the private tracker
+
+    WriteResult result = writer.complete();
+    assertThat(resolverCalls).hasValue(1);
+    assertThat(result.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    commitTransaction(result);
+
+    assertThat(actualRowSet("*")).isEqualTo(expectedRowSet());
+  }
+
+  @TestTemplate
   public void testTaskWriterIgnoresSharedInsertedRowTrackerOfAnotherKeyType() throws IOException {
     createAndInitTable(false);
     Types.StructType dataKeyType = table.schema().select("data").asStruct();

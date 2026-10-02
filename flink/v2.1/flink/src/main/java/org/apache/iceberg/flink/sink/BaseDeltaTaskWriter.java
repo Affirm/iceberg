@@ -59,7 +59,7 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<RowData> {
    * @param insertedRowTrackers resolves the inserted-row tracker to share for a partition (null for
    *     unpartitioned tables) and equality-key type, so that writers of the same table within one
    *     checkpoint retire re-writes of a key with position deletes; null to keep a private tracker
-   *     per writer
+   *     per writer. A writer also keeps a private tracker when the resolver returns null
    */
   BaseDeltaTaskWriter(
       PartitionSpec spec,
