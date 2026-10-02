@@ -40,6 +40,7 @@ import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.runtime.typeutils.RowDataSerializer;
 import org.apache.flink.table.types.logical.IntType;
@@ -450,6 +451,62 @@ public class TestDeltaTaskWriter extends TestBase {
     assertThat(secondResult.deleteFiles())
         .hasSize(1)
         .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+  }
+
+  @TestTemplate
+  void testTaskWritersShareInsertedRowTrackerAcrossKeyTypePromotion() throws IOException {
+    createAndInitTable(false);
+    InsertedRowTracker[] shared = new InsertedRowTracker[1];
+    BiFunction<StructLike, Types.StructType, InsertedRowTracker> resolver =
+        (partition, keyType) -> {
+          if (shared[0] == null) {
+            shared[0] = InsertedRowTracker.create(keyType);
+          }
+
+          return shared[0];
+        };
+    RowDataTaskWriterFactory intKeyFactory =
+        createTaskWriterFactory(Sets.newHashSet(idFieldId()), resolver);
+    intKeyFactory.initialize(1, 1);
+    TaskWriter<RowData> intKeyWriter = intKeyFactory.create();
+
+    // A writer of the promoted schema has a long key and shares the int-keyed tracker
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    RowDataTaskWriterFactory longKeyFactory =
+        createTaskWriterFactory(Sets.newHashSet(idFieldId()), resolver);
+    longKeyFactory.initialize(1, 1);
+    TaskWriter<RowData> longKeyWriter = longKeyFactory.create();
+
+    intKeyWriter.write(createInsert(1, "aaa"));
+    intKeyWriter.write(createInsert(2, "bbb"));
+    longKeyWriter.write(
+        GenericRowData.ofKind(RowKind.UPDATE_BEFORE, 1L, StringData.fromString("aaa")));
+    longKeyWriter.write(
+        GenericRowData.ofKind(RowKind.UPDATE_AFTER, 1L, StringData.fromString("ccc")));
+
+    WriteResult intKeyResult = intKeyWriter.complete();
+    WriteResult longKeyResult = longKeyWriter.complete();
+    assertThat(intKeyResult.deleteFiles()).isEmpty();
+    assertThat(longKeyResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(longKeyResult.referencedDataFiles())
+        .containsExactly(intKeyResult.dataFiles()[0].location());
+
+    RowDelta rowDelta = table.newRowDelta();
+    for (WriteResult result : ImmutableList.of(intKeyResult, longKeyResult)) {
+      Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
+      Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
+    }
+
+    rowDelta.commit();
+    Record first = GenericRecord.create(table.schema());
+    first.setField("id", 1L);
+    first.setField("data", "ccc");
+    Record second = GenericRecord.create(table.schema());
+    second.setField("id", 2L);
+    second.setField("data", "bbb");
+    assertThat(actualRowSet("*")).isEqualTo(expectedRowSet(first, second));
   }
 
   @TestTemplate
