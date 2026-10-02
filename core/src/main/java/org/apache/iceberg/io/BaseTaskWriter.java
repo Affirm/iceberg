@@ -226,30 +226,18 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
     }
 
     /**
-     * Returns whether keys of the given struct type can be stored and looked up in this tracker.
-     *
-     * <p>Keys are compared by position, type and optionality, which is what {@link StructLikeMap}
-     * uses; field names, docs and defaults may differ. Field IDs must match so that the two key
-     * types describe the same equality fields.
-     */
-    public boolean acceptsKeyType(Types.StructType otherKeyType) {
-      return matchesKeyType(otherKeyType, false);
-    }
-
-    /**
      * Returns whether writers whose equality-delete key has the given struct type can share this
      * tracker.
      *
-     * <p>This is {@link #acceptsKeyType} that also allows a key field's type to differ by a type
-     * promotion, in either direction: int and long, float and double, or decimals of the same
-     * scale. Field IDs, optionality and positions must still match. A key with a nested field is
-     * only shared when its type matches exactly.
+     * <p>Key fields are matched by position, field ID and optionality, which together with the type
+     * is what {@link StructLikeMap} compares; field names, docs and defaults may differ. A key
+     * field's type may also differ by a type promotion, in either direction: int and long, float
+     * and double, or decimals of the same scale. A writer with such a key type converts its keys to
+     * this tracker's key type. A key with a nested field is only shared when its type matches
+     * exactly.
      */
     public boolean canShareWith(Types.StructType otherKeyType) {
-      return matchesKeyType(otherKeyType, true);
-    }
-
-    private boolean matchesKeyType(Types.StructType otherKeyType, boolean allowPromotion) {
+      Preconditions.checkNotNull(otherKeyType, "Key type to share with cannot be null");
       List<Types.NestedField> fields = keyType.fields();
       List<Types.NestedField> otherFields = otherKeyType.fields();
       if (fields.size() != otherFields.size()) {
@@ -267,7 +255,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
         }
 
         if (!field.type().equals(otherField.type())) {
-          if (!allowPromotion || !isPromotion(field.type(), otherField.type())) {
+          if (!isPromotion(field.type(), otherField.type())) {
             return false;
           }
 
@@ -366,7 +354,8 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
   /**
    * A writer's view of a tracker whose key type differs from the writer's by type promotions. Keys
    * are converted to the tracker's key type when they have an exact value in it, otherwise to the
-   * widest type of each key field. Views never own the tracker they view.
+   * widest type of each key field. Views never own the tracker they view and are never shared, so
+   * the state they inherit (the widened-offsets field, clear()) stays unused.
    */
   private static class PromotedKeyView extends InsertedRowTracker {
     private final InsertedRowTracker tracker;

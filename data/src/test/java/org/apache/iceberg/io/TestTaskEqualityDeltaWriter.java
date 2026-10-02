@@ -643,7 +643,7 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
                 .build());
     InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(renamedKeyType);
 
-    assertThat(sharedInsertedRows.acceptsKeyType(deleteSchema.asStruct())).isTrue();
+    assertThat(sharedInsertedRows.canShareWith(deleteSchema.asStruct())).isTrue();
 
     GenericTaskDeltaWriter writer =
         createTaskWriter(
@@ -724,9 +724,9 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
     InsertedRowTracker tracker = InsertedRowTracker.create(keyType);
 
     assertThat(tracker.keyType()).isEqualTo(keyType);
-    assertThat(tracker.acceptsKeyType(keyType)).isTrue();
+    assertThat(tracker.canShareWith(keyType)).isTrue();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(
                     Types.NestedField.from(id)
                         .withName("renamed")
@@ -736,25 +736,28 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         .as("Names, docs and defaults do not affect how keys compare")
         .isTrue();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(Types.NestedField.from(id).withId(id.fieldId() + 100).build())))
         .as("A different field ID describes a different equality field")
         .isFalse();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(
                     Types.NestedField.from(id).isOptional(!id.isOptional()).build())))
         .as("Optionality must match")
         .isFalse();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(
                     Types.NestedField.from(id).ofType(Types.LongType.get()).build())))
-        .as("A promoted key type compares differently")
-        .isFalse();
-    assertThat(tracker.acceptsKeyType(Types.StructType.of(id, table.schema().findField("data"))))
+        .as("A promoted key type is shared through a converting view")
+        .isTrue();
+    assertThat(tracker.canShareWith(Types.StructType.of(id, table.schema().findField("data"))))
         .as("The number of key fields must match")
         .isFalse();
+    assertThatThrownBy(() -> tracker.canShareWith(null))
+        .isInstanceOf(NullPointerException.class)
+        .hasMessage("Key type to share with cannot be null");
 
     assertThatThrownBy(() -> InsertedRowTracker.create(null))
         .isInstanceOf(NullPointerException.class)
@@ -1011,7 +1014,6 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
     table.updateSchema().updateColumn("amount", Types.DecimalType.of(12, 2)).commit();
     Schema wideSchema = table.schema();
     Schema wideKey = wideSchema.select("amount");
-    assertThat(sharedInsertedRows.acceptsKeyType(wideKey.asStruct())).isFalse();
     assertThat(sharedInsertedRows.canShareWith(wideKey.asStruct())).isTrue();
     GenericTaskDeltaWriter wide =
         createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
@@ -1213,10 +1215,6 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
     assertThat(tracker.canShareWith(Types.StructType.of(id, data))).isTrue();
     assertThat(tracker.canShareWith(Types.StructType.of(withType(id, Types.LongType.get()), data)))
         .isTrue();
-    assertThat(
-            tracker.acceptsKeyType(Types.StructType.of(withType(id, Types.LongType.get()), data)))
-        .as("acceptsKeyType stays strict")
-        .isFalse();
     assertThat(
             tracker.canShareWith(
                 Types.StructType.of(
