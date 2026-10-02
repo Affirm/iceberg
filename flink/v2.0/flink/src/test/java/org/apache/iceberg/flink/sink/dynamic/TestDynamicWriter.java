@@ -1083,6 +1083,34 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     dynamicWriter.close();
   }
 
+  @Test
+  void testLaterUpsertRemovesDuplicateLeftByUnsharedTrackers() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, REQUIRED_KEY_SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    // Writers that cannot share a tracker leave both rows of a key re-written within one
+    // checkpoint: the second writer's equality delete has the same sequence number as the first
+    // writer's data file, so it does not apply to it.
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "first")), null);
+    table.updateSchema().makeColumnOptional("id").commit();
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "second")), null);
+    commit(table, dynamicWriter.prepareCommit());
+    assertTableRows(
+        table, SimpleDataUtil.createRecord(1, "first"), SimpleDataUtil.createRecord(1, "second"));
+
+    // An upsert of the key in a later checkpoint writes an equality delete with a higher sequence
+    // number, which applies to both rows.
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "third")), null);
+    commit(table, dynamicWriter.prepareCommit());
+    assertTableRows(table, SimpleDataUtil.createRecord(1, "third"));
+
+    dynamicWriter.close();
+  }
+
   private static Record record(Table table, long id, String data, String extra) {
     Record record = GenericRecord.create(table.schema());
     record.setField("id", id);
