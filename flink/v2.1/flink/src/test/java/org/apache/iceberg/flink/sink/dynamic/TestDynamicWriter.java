@@ -27,6 +27,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import org.apache.flink.configuration.Configuration;
@@ -465,18 +466,27 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
     Schema schemaAfter = table.schema();
     dynamicWriter.write(upsertRecord(table, schemaAfter, rowData(1, "after", "x")), null);
+    dynamicWriter.write(upsertRecord(table, schemaAfter, rowData(2, "changed", "y")), null);
+
+    Object group = onlyTrackerGroup(dynamicWriter);
+    assertThat((Map<?, ?>) hiddenField(group, "byPartition")).hasSize(2);
+    assertThat((Set<?>) hiddenField(group, "sharingSchemaIds"))
+        .as("The second writer was handed the first writer's trackers")
+        .isEqualTo(Sets.newHashSet(schemaAfter.schemaId()));
+    assertThat((Boolean) hiddenField(group, "warnedPartitionTypes")).isFalse();
 
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(results).hasSize(2);
     assertThat(deleteFiles(results))
+        .as("One position delete per partition")
         .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
-        .hasSize(1);
+        .hasSize(2);
 
     commit(table, results);
     assertTableRows(
         table,
         SimpleDataUtil.createRecord(1, "after", "x"),
-        SimpleDataUtil.createRecord(2, "other", null));
+        SimpleDataUtil.createRecord(2, "changed", "y"));
 
     dynamicWriter.close();
   }
@@ -922,7 +932,7 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
   }
 
   @Test
-  void testUpsertAcrossPromotionOfIdentityPartitionedKeyDoesNotShareTracker() throws Exception {
+  void testUpsertAcrossPromotionOfIdentityPartitionedKeyFailsToCommit() throws Exception {
     Catalog catalog = CATALOG_EXTENSION.catalog();
     PartitionSpec spec = PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("id").build();
     Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA, spec);
@@ -932,10 +942,13 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
         upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(5, "before")), null);
 
     // Promoting the identity partition source turns the partition value from Integer(5) into
-    // Long(5). Data files with both values cannot be committed together, so the writers keep
-    // separate trackers for the two values and the re-write is not retired by a position delete.
+    // Long(5). Data files of one spec with both value types cannot be committed together, which is
+    // a limitation of committing, with or without a shared tracker. So the writers keep separate
+    // trackers for the two values and the re-write is not retired by a position delete. Once such
+    // files can be committed, this test should expect a shared tracker instead.
     table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
     dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(5L, "after")), null);
+    assertSeparatePartitionTrackers(dynamicWriter, 2);
 
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(deleteFiles(results))
@@ -949,7 +962,7 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
   }
 
   @Test
-  void testCdcUpdateAcrossPromotionOfNonKeyPartitionColumnDoesNotShareTracker() throws Exception {
+  void testCdcUpdateAcrossPromotionOfNonKeyPartitionColumnFailsToCommit() throws Exception {
     Catalog catalog = CATALOG_EXTENSION.catalog();
     Schema schema =
         new Schema(
@@ -972,8 +985,9 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
 
     // Promoting the identity partition column, which is not part of the key, turns the partition
     // values from Integer into Long. The second writer gets other trackers for them, so its
-    // UPDATE_BEFOREs become equality deletes. Data files with both value types cannot be committed
-    // together, with or without a shared tracker.
+    // UPDATE_BEFOREs become equality deletes. Data files of one spec with both value types cannot
+    // be committed together, with or without a shared tracker; once they can, this test should
+    // expect a shared tracker instead.
     table.updateSchema().updateColumn("region", Types.LongType.get()).commit();
     Schema schemaAfter = table.schema();
     for (long region : new long[] {5L, 6L}) {
@@ -993,6 +1007,9 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
           null);
     }
 
+    // regions 5 and 6, each as an Integer and as a Long
+    assertSeparatePartitionTrackers(dynamicWriter, 4);
+
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(deleteFiles(results))
         .hasSize(2)
@@ -1005,7 +1022,7 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
   }
 
   @Test
-  void testCdcUpdateAcrossPromotionOfFloatPartitionColumnDoesNotShareTracker() throws Exception {
+  void testCdcUpdateAcrossPromotionOfFloatPartitionColumnFailsToCommit() throws Exception {
     Catalog catalog = CATALOG_EXTENSION.catalog();
     Schema schema =
         new Schema(
@@ -1032,6 +1049,7 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
             schemaAfter,
             GenericRowData.ofKind(RowKind.UPDATE_BEFORE, 1, StringData.fromString("before"), 1.5d)),
         null);
+    assertSeparatePartitionTrackers(dynamicWriter, 2);
 
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(deleteFiles(results))
@@ -1155,6 +1173,26 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     Map<?, ?> trackers = insertedRowTrackers(dynamicWriter);
     assertThat(trackers).hasSize(1);
     return (List<?>) trackers.values().iterator().next();
+  }
+
+  private static Object onlyTrackerGroup(DynamicWriter dynamicWriter) {
+    List<?> groups = trackerGroups(dynamicWriter);
+    assertThat(groups).hasSize(1);
+    return groups.get(0);
+  }
+
+  private static Object hiddenField(Object target, String name) {
+    return DynFields.builder().hiddenImpl(target.getClass(), name).build(target).get();
+  }
+
+  // The same partition values in two types keep separate trackers, the type change was detected,
+  // and no writer was handed a tracker of another writer, so no "share" message is logged
+  private static void assertSeparatePartitionTrackers(
+      DynamicWriter dynamicWriter, int partitionTrackers) {
+    Object group = onlyTrackerGroup(dynamicWriter);
+    assertThat((Map<?, ?>) hiddenField(group, "byPartition")).hasSize(partitionTrackers);
+    assertThat((Boolean) hiddenField(group, "warnedPartitionTypes")).isTrue();
+    assertThat((Set<?>) hiddenField(group, "sharingSchemaIds")).isEmpty();
   }
 
   private static Collection<DynamicWriteResult> resultsFor(
