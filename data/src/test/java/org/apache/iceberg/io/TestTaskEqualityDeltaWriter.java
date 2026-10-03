@@ -23,6 +23,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -58,8 +60,11 @@ import org.apache.iceberg.io.BaseTaskWriter.InsertedRowTracker;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ArrayUtil;
 import org.apache.iceberg.util.StructLikeSet;
@@ -638,7 +643,7 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
                 .build());
     InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(renamedKeyType);
 
-    assertThat(sharedInsertedRows.acceptsKeyType(deleteSchema.asStruct())).isTrue();
+    assertThat(sharedInsertedRows.canShareWith(deleteSchema.asStruct())).isTrue();
 
     GenericTaskDeltaWriter writer =
         createTaskWriter(
@@ -665,7 +670,7 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
                     equalityFieldIds, deleteSchema, DeleteGranularity.FILE, dataKeyedTracker))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("Shared inserted-row tracker key type")
-        .hasMessageContaining("must match equality-delete schema");
+        .hasMessageContaining("cannot be shared with equality-delete schema");
   }
 
   @TestTemplate
@@ -719,9 +724,9 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
     InsertedRowTracker tracker = InsertedRowTracker.create(keyType);
 
     assertThat(tracker.keyType()).isEqualTo(keyType);
-    assertThat(tracker.acceptsKeyType(keyType)).isTrue();
+    assertThat(tracker.canShareWith(keyType)).isTrue();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(
                     Types.NestedField.from(id)
                         .withName("renamed")
@@ -731,29 +736,586 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         .as("Names, docs and defaults do not affect how keys compare")
         .isTrue();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(Types.NestedField.from(id).withId(id.fieldId() + 100).build())))
         .as("A different field ID describes a different equality field")
         .isFalse();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(
                     Types.NestedField.from(id).isOptional(!id.isOptional()).build())))
         .as("Optionality must match")
         .isFalse();
     assertThat(
-            tracker.acceptsKeyType(
+            tracker.canShareWith(
                 Types.StructType.of(
                     Types.NestedField.from(id).ofType(Types.LongType.get()).build())))
-        .as("A promoted key type compares differently")
-        .isFalse();
-    assertThat(tracker.acceptsKeyType(Types.StructType.of(id, table.schema().findField("data"))))
+        .as("A promoted key type is shared through a converting view")
+        .isTrue();
+    assertThat(tracker.canShareWith(Types.StructType.of(id, table.schema().findField("data"))))
         .as("The number of key fields must match")
         .isFalse();
+    assertThatThrownBy(() -> tracker.canShareWith(null))
+        .isInstanceOf(NullPointerException.class)
+        .hasMessage("Key type to share with cannot be null");
 
     assertThatThrownBy(() -> InsertedRowTracker.create(null))
         .isInstanceOf(NullPointerException.class)
         .hasMessage("Inserted-row tracker key type cannot be null");
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerAcrossIntToLongKeyPromotion() throws Exception {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId);
+    Schema narrowSchema = table.schema();
+    Schema narrowKey = narrowSchema.select("id");
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(narrowKey.asStruct());
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(equalityFieldIds, narrowKey, DeleteGranularity.FILE, sharedInsertedRows);
+    assertThat(insertedRows(narrow)).isSameAs(sharedInsertedRows);
+
+    narrow.write(record(narrowSchema, 1, "aaa"));
+    narrow.write(record(narrowSchema, 2, "bbb"));
+
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    Schema wideSchema = table.schema();
+    Schema wideKey = wideSchema.select("id");
+    GenericTaskDeltaWriter wide =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    assertThat(insertedRows(wide))
+        .as("A writer with a promoted key type converts its keys through a view")
+        .isNotSameAs(sharedInsertedRows);
+
+    // the long-keyed writer retires both rows of the int-keyed writer, by write and by deleteKey
+    wide.write(record(wideSchema, 1L, "ccc"));
+    wide.deleteKey(record(wideKey, 2L));
+    // and the int-keyed writer finds the row the long-keyed writer wrote
+    narrow.write(record(narrowSchema, 1, "ddd"));
+
+    WriteResult narrowResult = narrow.complete();
+    WriteResult wideResult = wide.complete();
+    assertThat(wideResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(wideResult.referencedDataFiles())
+        .containsExactly(narrowResult.dataFiles()[0].location());
+    assertThat(narrowResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(narrowResult.referencedDataFiles())
+        .containsExactly(wideResult.dataFiles()[0].location());
+
+    commit(narrowResult, wideResult);
+    assertThat(actualRowSet("*"))
+        .isEqualTo(expectedRowSet(ImmutableList.of(record(table.schema(), 1L, "ddd"))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerKeyedByLongAcrossIntKeyWriter() throws Exception {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId);
+    Schema narrowSchema = table.schema();
+    Types.StructType wideKeyType =
+        Types.StructType.of(Types.NestedField.required(idFieldId, "id", Types.LongType.get()));
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(wideKeyType);
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(
+            equalityFieldIds,
+            narrowSchema.select("id"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+    assertThat(insertedRows(narrow)).isNotSameAs(sharedInsertedRows);
+
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    Schema wideSchema = table.schema();
+    Schema wideKey = wideSchema.select("id");
+    GenericTaskDeltaWriter wide =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    assertThat(insertedRows(wide)).isSameAs(sharedInsertedRows);
+
+    // the tracker is keyed by long, so here the int-keyed writer converts its keys up
+    wide.write(record(wideSchema, 1L, "wide"));
+    narrow.write(record(narrowSchema, 1, "narrow"));
+    narrow.write(record(narrowSchema, 2, "other"));
+    wide.deleteKey(record(wideKey, 2L));
+
+    WriteResult wideResult = wide.complete();
+    WriteResult narrowResult = narrow.complete();
+    assertThat(narrowResult.referencedDataFiles())
+        .containsExactly(wideResult.dataFiles()[0].location());
+    assertThat(wideResult.referencedDataFiles())
+        .containsExactly(narrowResult.dataFiles()[0].location());
+    assertThat(
+            Iterables.concat(
+                Arrays.asList(wideResult.deleteFiles()), Arrays.asList(narrowResult.deleteFiles())))
+        .hasSize(2)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+
+    commit(narrowResult, wideResult);
+    assertThat(actualRowSet("*"))
+        .isEqualTo(expectedRowSet(ImmutableList.of(record(table.schema(), 1L, "narrow"))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerKeyedByDoubleAcrossFloatKeyWriter() throws IOException {
+    table.updateSchema().addColumn("f", Types.FloatType.get()).commit();
+    int floatFieldId = table.schema().findField("f").fieldId();
+    List<Integer> equalityFieldIds = Lists.newArrayList(floatFieldId);
+    Schema narrowSchema = table.schema();
+    InsertedRowTracker sharedInsertedRows =
+        InsertedRowTracker.create(
+            Types.StructType.of(
+                Types.NestedField.optional(floatFieldId, "f", Types.DoubleType.get())));
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(
+            equalityFieldIds, narrowSchema.select("f"), DeleteGranularity.FILE, sharedInsertedRows);
+
+    table.updateSchema().updateColumn("f", Types.DoubleType.get()).commit();
+    Schema wideSchema = table.schema();
+    GenericTaskDeltaWriter wide =
+        createTaskWriter(
+            equalityFieldIds, wideSchema.select("f"), DeleteGranularity.FILE, sharedInsertedRows);
+
+    // the tracker is keyed by double, so the float-keyed writer converts its keys up
+    wide.write(record(wideSchema, 1, "wide", 1.5d));
+    narrow.write(record(narrowSchema, 2, "narrow", 1.5f));
+
+    WriteResult wideResult = wide.complete();
+    WriteResult narrowResult = narrow.complete();
+    assertThat(narrowResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(narrowResult.referencedDataFiles())
+        .containsExactly(wideResult.dataFiles()[0].location());
+
+    commit(wideResult, narrowResult);
+    assertThat(actualRowSet("*"))
+        .isEqualTo(expectedRowSet(ImmutableList.of(record(table.schema(), 2, "narrow", 1.5d))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerKeepsKeysOutsideIntRangeApart() throws IOException {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId, dataFieldId);
+    Schema narrowSchema = table.schema();
+    Schema narrowKey = narrowSchema.select("id", "data");
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(narrowKey.asStruct());
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(equalityFieldIds, narrowKey, DeleteGranularity.FILE, sharedInsertedRows);
+
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    Schema wideSchema = table.schema();
+    Schema wideKey = wideSchema.select("id", "data");
+    GenericTaskDeltaWriter first =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    GenericTaskDeltaWriter second =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    long wideId = Integer.MAX_VALUE + 1L;
+
+    // no long-keyed writer has written a key outside the int range yet
+    first.deleteKey(record(wideKey, wideId + 1, "aaa"));
+    first.write(record(wideSchema, wideId, "aaa"));
+    // the same key through another long-keyed writer is retired with a position delete
+    second.write(record(wideSchema, wideId, "aaa"));
+    // keys outside the int range that no writer has written are not found
+    second.deleteKey(record(wideKey, wideId + 1, "aaa"));
+    // the int that the long narrows to is a different key
+    narrow.deleteKey(record(narrowKey, (int) wideId, "aaa"));
+
+    WriteResult firstResult = first.complete();
+    WriteResult secondResult = second.complete();
+    WriteResult narrowResult = narrow.complete();
+    assertThat(firstResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+    assertThat(secondResult.deleteFiles())
+        .hasSize(2)
+        .extracting(DeleteFile::content)
+        .containsExactlyInAnyOrder(FileContent.POSITION_DELETES, FileContent.EQUALITY_DELETES);
+    assertThat(secondResult.referencedDataFiles())
+        .containsExactly(firstResult.dataFiles()[0].location());
+    assertThat(narrowResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+
+    commit(firstResult, secondResult);
+    assertThat(actualRowSet("*"))
+        .isEqualTo(expectedRowSet(ImmutableList.of(record(table.schema(), wideId, "aaa"))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerAcrossFloatToDoubleKeyPromotion() throws IOException {
+    table.updateSchema().addColumn("f", Types.FloatType.get()).commit();
+    List<Integer> equalityFieldIds = Lists.newArrayList(table.schema().findField("f").fieldId());
+    Schema narrowSchema = table.schema();
+    Schema narrowKey = narrowSchema.select("f");
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(narrowKey.asStruct());
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(equalityFieldIds, narrowKey, DeleteGranularity.FILE, sharedInsertedRows);
+    narrow.write(record(narrowSchema, 1, "exact", 1.5f));
+    narrow.write(record(narrowSchema, 2, "nan", Float.NaN));
+    narrow.write(record(narrowSchema, 3, "negative zero", -0.0f));
+    narrow.write(record(narrowSchema, 4, "float tenth", 0.1f));
+
+    table.updateSchema().updateColumn("f", Types.DoubleType.get()).commit();
+    Schema wideSchema = table.schema();
+    Schema wideKey = wideSchema.select("f");
+    GenericTaskDeltaWriter wide =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    GenericTaskDeltaWriter other =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+
+    // doubles with an exact float value, NaN included, find the float-keyed writer's rows
+    wide.write(record(wideSchema, 5, "exact", 1.5d));
+    wide.write(record(wideSchema, 6, "nan", Double.NaN));
+    // positive and negative zero are different keys, as in equality deletes
+    wide.write(record(wideSchema, 7, "positive zero", 0.0d));
+    // 0.1 has no exact float value, so it is not the float closest to it
+    wide.write(record(wideSchema, 8, "double tenth", 0.1d));
+    other.write(record(wideSchema, 9, "double tenth", 0.1d));
+
+    WriteResult narrowResult = narrow.complete();
+    WriteResult wideResult = wide.complete();
+    WriteResult otherResult = other.complete();
+    assertThat(narrowResult.deleteFiles()).isEmpty();
+    assertThat(wideResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES)
+        .allMatch(file -> file.recordCount() == 2);
+    assertThat(wideResult.referencedDataFiles())
+        .containsExactly(narrowResult.dataFiles()[0].location());
+    assertThat(otherResult.referencedDataFiles())
+        .containsExactly(wideResult.dataFiles()[0].location());
+
+    commit(narrowResult, wideResult, otherResult);
+    Schema schema = table.schema();
+    assertThat(actualRowSet("*"))
+        .isEqualTo(
+            expectedRowSet(
+                ImmutableList.of(
+                    record(schema, 3, "negative zero", -0.0d),
+                    record(schema, 4, "float tenth", (double) 0.1f),
+                    record(schema, 5, "exact", 1.5d),
+                    record(schema, 6, "nan", Double.NaN),
+                    record(schema, 7, "positive zero", 0.0d),
+                    record(schema, 9, "double tenth", 0.1d))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerAcrossDecimalPrecisionWidening() throws Exception {
+    table.updateSchema().addColumn("amount", Types.DecimalType.of(10, 2)).commit();
+    List<Integer> equalityFieldIds =
+        Lists.newArrayList(table.schema().findField("amount").fieldId());
+    Schema narrowSchema = table.schema();
+    Schema narrowKey = narrowSchema.select("amount");
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(narrowKey.asStruct());
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(equalityFieldIds, narrowKey, DeleteGranularity.FILE, sharedInsertedRows);
+    narrow.write(record(narrowSchema, 1, "aaa", new BigDecimal("12.34")));
+
+    table.updateSchema().updateColumn("amount", Types.DecimalType.of(12, 2)).commit();
+    Schema wideSchema = table.schema();
+    Schema wideKey = wideSchema.select("amount");
+    assertThat(sharedInsertedRows.canShareWith(wideKey.asStruct())).isTrue();
+    GenericTaskDeltaWriter wide =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    assertThat(insertedRows(wide))
+        .as("Decimals of the same scale need no conversion")
+        .isSameAs(sharedInsertedRows);
+    wide.write(record(wideSchema, 2, "bbb", new BigDecimal("12.34")));
+
+    WriteResult narrowResult = narrow.complete();
+    WriteResult wideResult = wide.complete();
+    assertThat(wideResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+
+    commit(narrowResult, wideResult);
+    assertThat(actualRowSet("*"))
+        .isEqualTo(
+            expectedRowSet(
+                ImmutableList.of(record(table.schema(), 2, "bbb", new BigDecimal("12.34")))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerAcrossPromotionsOfTwoKeyFields() throws IOException {
+    table
+        .updateSchema()
+        .addColumn("k", Types.IntegerType.get())
+        .addColumn("f", Types.FloatType.get())
+        .commit();
+    List<Integer> equalityFieldIds =
+        Lists.newArrayList(
+            table.schema().findField("k").fieldId(), table.schema().findField("f").fieldId());
+    Schema intFloatSchema = table.schema();
+    InsertedRowTracker sharedInsertedRows =
+        InsertedRowTracker.create(intFloatSchema.select("k", "f").asStruct());
+    GenericTaskDeltaWriter intFloat =
+        createTaskWriter(
+            equalityFieldIds,
+            intFloatSchema.select("k", "f"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+
+    table.updateSchema().updateColumn("k", Types.LongType.get()).commit();
+    Schema longFloatSchema = table.schema();
+    GenericTaskDeltaWriter longFloat =
+        createTaskWriter(
+            equalityFieldIds,
+            longFloatSchema.select("k", "f"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+
+    table.updateSchema().updateColumn("f", Types.DoubleType.get()).commit();
+    Schema longDoubleSchema = table.schema();
+    GenericTaskDeltaWriter longDouble =
+        createTaskWriter(
+            equalityFieldIds,
+            longDoubleSchema.select("k", "f"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+    long wideKey = Integer.MAX_VALUE + 1L;
+
+    // each key field converts on its own
+    intFloat.write(record(intFloatSchema, 1, "aaa", 1, 1.5f));
+    longDouble.write(record(longDoubleSchema, 2, "bbb", 1L, 1.5d));
+    // a long outside the int range keeps the key apart, with the float widened to double
+    longFloat.write(record(longFloatSchema, 3, "ccc", wideKey, 2.5f));
+    longDouble.write(record(longDoubleSchema, 4, "ddd", wideKey, 2.5d));
+
+    WriteResult intFloatResult = intFloat.complete();
+    WriteResult longFloatResult = longFloat.complete();
+    WriteResult longDoubleResult = longDouble.complete();
+    assertThat(longDoubleResult.deleteFiles())
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(longDoubleResult.referencedDataFiles())
+        .containsExactlyInAnyOrder(
+            intFloatResult.dataFiles()[0].location(), longFloatResult.dataFiles()[0].location());
+
+    commit(intFloatResult, longFloatResult, longDoubleResult);
+    assertThat(actualRowSet("*"))
+        .isEqualTo(
+            expectedRowSet(
+                ImmutableList.of(
+                    record(table.schema(), 2, "bbb", 1L, 1.5d),
+                    record(table.schema(), 4, "ddd", wideKey, 2.5d))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerMatchesNullKeysThroughView() throws IOException {
+    table
+        .updateSchema()
+        .addColumn("k", Types.IntegerType.get())
+        .addColumn("f", Types.FloatType.get())
+        .commit();
+    List<Integer> equalityFieldIds =
+        Lists.newArrayList(
+            table.schema().findField("k").fieldId(), table.schema().findField("f").fieldId());
+    Schema intFloatSchema = table.schema();
+    InsertedRowTracker sharedInsertedRows =
+        InsertedRowTracker.create(intFloatSchema.select("k", "f").asStruct());
+    GenericTaskDeltaWriter intFloat =
+        createTaskWriter(
+            equalityFieldIds,
+            intFloatSchema.select("k", "f"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+
+    // promoted in the other order than above: the float first
+    table.updateSchema().updateColumn("f", Types.DoubleType.get()).commit();
+    Schema intDoubleSchema = table.schema();
+    GenericTaskDeltaWriter intDouble =
+        createTaskWriter(
+            equalityFieldIds,
+            intDoubleSchema.select("k", "f"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+
+    table.updateSchema().updateColumn("k", Types.LongType.get()).commit();
+    Schema longDoubleSchema = table.schema();
+    GenericTaskDeltaWriter longDouble =
+        createTaskWriter(
+            equalityFieldIds,
+            longDoubleSchema.select("k", "f"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+
+    // null key values pass through the conversion and match null
+    intFloat.write(record(intFloatSchema, 1, "aaa", null, null));
+    intFloat.write(record(intFloatSchema, 2, "bbb", null, 1.5f));
+    longDouble.write(record(longDoubleSchema, 3, "ccc", null, null));
+    intDouble.write(record(intDoubleSchema, 4, "ddd", null, 1.5d));
+    // keys without a float value, with the int widened to long or a null passed through
+    intDouble.write(record(intDoubleSchema, 5, "eee", 3, 0.1d));
+    intDouble.write(record(intDoubleSchema, 6, "fff", null, 0.3d));
+    longDouble.write(record(longDoubleSchema, 7, "ggg", 3L, 0.1d));
+    longDouble.write(record(longDoubleSchema, 8, "hhh", null, 0.3d));
+
+    WriteResult intFloatResult = intFloat.complete();
+    WriteResult intDoubleResult = intDouble.complete();
+    WriteResult longDoubleResult = longDouble.complete();
+    assertThat(intDoubleResult.referencedDataFiles())
+        .containsExactly(intFloatResult.dataFiles()[0].location());
+    assertThat(longDoubleResult.referencedDataFiles())
+        .containsExactlyInAnyOrder(
+            intFloatResult.dataFiles()[0].location(), intDoubleResult.dataFiles()[0].location());
+
+    commit(intFloatResult, intDoubleResult, longDoubleResult);
+    Schema schema = table.schema();
+    assertThat(actualRowSet("*"))
+        .isEqualTo(
+            expectedRowSet(
+                ImmutableList.of(
+                    record(schema, 3, "ccc", null, null),
+                    record(schema, 4, "ddd", null, 1.5d),
+                    record(schema, 7, "ggg", 3L, 0.1d),
+                    record(schema, 8, "hhh", null, 0.3d))));
+  }
+
+  @TestTemplate
+  void testSharedInsertedRowTrackerRetiresRowsDeletedThroughPromotedWriter() throws IOException {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId);
+    Schema narrowSchema = table.schema();
+    InsertedRowTracker sharedInsertedRows =
+        InsertedRowTracker.create(narrowSchema.select("id").asStruct());
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(
+            equalityFieldIds,
+            narrowSchema.select("id"),
+            DeleteGranularity.FILE,
+            sharedInsertedRows);
+    narrow.write(record(narrowSchema, 1, "aaa"));
+    narrow.write(record(narrowSchema, 2, "bbb"));
+
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    Schema wideSchema = table.schema();
+    Schema wideKey = wideSchema.select("id");
+    GenericTaskDeltaWriter wide =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    // an upsert's key delete and a CDC row delete both look the key up through the view
+    wide.deleteKey(record(wideKey, 1L));
+    wide.delete(record(wideSchema, 2L, "bbb"));
+
+    WriteResult narrowResult = narrow.complete();
+    WriteResult wideResult = wide.complete();
+    assertThat(wideResult.dataFiles()).isEmpty();
+    assertThat(wideResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES)
+        .allMatch(file -> file.recordCount() == 2);
+
+    commit(narrowResult, wideResult);
+    assertThat(actualRowSet("*")).isEqualTo(expectedRowSet(ImmutableList.of()));
+  }
+
+  @TestTemplate
+  void testInsertedRowTrackerCanShareWithPromotedKeyTypes() {
+    Types.NestedField id = Types.NestedField.required(1, "id", Types.IntegerType.get());
+    Types.NestedField data = Types.NestedField.required(2, "data", Types.StringType.get());
+    InsertedRowTracker tracker = InsertedRowTracker.create(Types.StructType.of(id, data));
+
+    assertThat(tracker.canShareWith(Types.StructType.of(id, data))).isTrue();
+    assertThat(tracker.canShareWith(Types.StructType.of(withType(id, Types.LongType.get()), data)))
+        .isTrue();
+    assertThat(
+            tracker.canShareWith(
+                Types.StructType.of(
+                    Types.NestedField.required(1, "renamed_id", Types.LongType.get()), data)))
+        .as("A rename together with a promotion")
+        .isTrue();
+    assertThat(
+            tracker.canShareWith(
+                Types.StructType.of(
+                    Types.NestedField.optional(1, "id", Types.LongType.get()), data)))
+        .as("Optionality must still match")
+        .isFalse();
+    assertThat(tracker.canShareWith(Types.StructType.of(data, id)))
+        .as("Key field positions must still match")
+        .isFalse();
+    assertThat(
+            tracker.canShareWith(
+                Types.StructType.of(
+                    Types.NestedField.required(3, "id", Types.LongType.get()), data)))
+        .as("Field IDs must still match")
+        .isFalse();
+    assertThat(tracker.canShareWith(Types.StructType.of(withType(id, Types.LongType.get()))))
+        .as("The number of key fields must still match")
+        .isFalse();
+
+    Types.NestedField amount = Types.NestedField.required(3, "amount", Types.DecimalType.of(10, 2));
+    InsertedRowTracker decimalTracker = InsertedRowTracker.create(Types.StructType.of(amount));
+    assertThat(
+            decimalTracker.canShareWith(
+                Types.StructType.of(withType(amount, Types.DecimalType.of(12, 2)))))
+        .isTrue();
+    assertThat(
+            decimalTracker.canShareWith(
+                Types.StructType.of(withType(amount, Types.DecimalType.of(12, 3)))))
+        .as("A decimal's scale cannot change")
+        .isFalse();
+    assertThat(
+            decimalTracker.canShareWith(
+                Types.StructType.of(withType(amount, Types.IntegerType.get()))))
+        .isFalse();
+
+    Types.NestedField struct =
+        Types.NestedField.required(
+            4,
+            "struct",
+            Types.StructType.of(Types.NestedField.required(5, "inner", Types.IntegerType.get())));
+    InsertedRowTracker nestedTracker = InsertedRowTracker.create(Types.StructType.of(struct, id));
+    assertThat(nestedTracker.canShareWith(Types.StructType.of(struct, id))).isTrue();
+    assertThat(
+            nestedTracker.canShareWith(
+                Types.StructType.of(struct, withType(id, Types.LongType.get()))))
+        .as("A key with a nested field is only shared when its type matches exactly")
+        .isFalse();
+    assertThat(
+            nestedTracker.canShareWith(
+                Types.StructType.of(
+                    withType(
+                        struct,
+                        Types.StructType.of(
+                            Types.NestedField.required(5, "inner", Types.LongType.get()))),
+                    id)))
+        .isFalse();
+  }
+
+  @TestTemplate
+  void testInsertedRowTrackerSharesAcrossExactlyTheAllowedTypePromotions() {
+    List<Type.PrimitiveType> types =
+        ImmutableList.of(
+            Types.BooleanType.get(),
+            Types.IntegerType.get(),
+            Types.LongType.get(),
+            Types.FloatType.get(),
+            Types.DoubleType.get(),
+            Types.DateType.get(),
+            Types.TimeType.get(),
+            Types.TimestampType.withoutZone(),
+            Types.TimestampType.withZone(),
+            Types.TimestampNanoType.withoutZone(),
+            Types.StringType.get(),
+            Types.UUIDType.get(),
+            Types.BinaryType.get(),
+            Types.FixedType.ofLength(4),
+            Types.DecimalType.of(9, 2),
+            Types.DecimalType.of(18, 2),
+            Types.DecimalType.of(18, 4));
+
+    for (Type.PrimitiveType type : types) {
+      InsertedRowTracker tracker =
+          InsertedRowTracker.create(
+              Types.StructType.of(Types.NestedField.optional(1, "key", type)));
+      for (Type.PrimitiveType otherType : types) {
+        boolean promotion =
+            TypeUtil.isPromotionAllowed(type, otherType)
+                || TypeUtil.isPromotionAllowed(otherType, type);
+        assertThat(
+                tracker.canShareWith(
+                    Types.StructType.of(Types.NestedField.optional(1, "key", otherType))))
+            .as("%s and %s", type, otherType)
+            .isEqualTo(promotion);
+      }
+    }
   }
 
   /**
@@ -882,6 +1444,36 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
         return data;
       }
     }
+  }
+
+  private static Types.NestedField withType(Types.NestedField field, Type type) {
+    return Types.NestedField.from(field).ofType(type).build();
+  }
+
+  private static Record record(Schema schema, Object... values) {
+    Record record = GenericRecord.create(schema);
+    for (int pos = 0; pos < values.length; pos += 1) {
+      record.set(pos, values[pos]);
+    }
+
+    return record;
+  }
+
+  private static Object insertedRows(GenericTaskDeltaWriter writer)
+      throws ReflectiveOperationException {
+    Field field = BaseTaskWriter.BaseEqualityDeltaWriter.class.getDeclaredField("insertedRows");
+    field.setAccessible(true);
+    return field.get(writer.deltaWriter);
+  }
+
+  private void commit(WriteResult... results) {
+    RowDelta rowDelta = table.newRowDelta();
+    for (WriteResult result : results) {
+      Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
+      Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
+    }
+
+    rowDelta.commit();
   }
 
   private List<Record> readRecordsAsList(Schema schema, CharSequence path) throws IOException {

@@ -130,7 +130,7 @@ public class RowDataTaskWriterFactory implements TaskWriterFactory<RowData> {
    * @param insertedRowTrackers resolves, for a partition (null when unpartitioned) and equality-key
    *     struct type, the inserted-row tracker that delta writers created by this factory share with
    *     other writers of the same table within one checkpoint; null to keep a private tracker per
-   *     writer
+   *     writer. A writer also keeps a private tracker when the resolver returns null
    */
   public RowDataTaskWriterFactory(
       SerializableSupplier<Table> tableSupplier,

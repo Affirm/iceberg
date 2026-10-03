@@ -39,6 +39,7 @@ import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.CharSequenceSet;
 import org.apache.iceberg.util.StructLikeMap;
@@ -186,14 +187,27 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
    * table within one commit, for example when a schema evolution makes a sink open a second writer
    * mid-commit. A shared tracker lives as long as the commit it belongs to; the sink that created
    * it drops it at commit time, and a writer only clears a tracker it created itself.
+   *
+   * <p>Writers whose key types differ by a type promotion can share a tracker too, see {@link
+   * #canShareWith}. Such a writer converts its keys to this tracker's key type. A key that has no
+   * exact value in that type, such as a long outside the int range, can only equal keys of other
+   * promoted writers; it is kept apart, in the widest type of each key field.
    */
   public static class InsertedRowTracker {
     private final Types.StructType keyType;
     private final Map<StructLike, PathOffset> offsetsByKey;
+    // Keys without an exact value in keyType, created when a promoted writer first writes one
+    private Map<StructLike, PathOffset> widenedOffsetsByKey = null;
 
     private InsertedRowTracker(Types.StructType keyType) {
       this.keyType = keyType;
       this.offsetsByKey = StructLikeMap.create(keyType);
+    }
+
+    // Shares the key type and offsets of the given tracker, for a view of it
+    private InsertedRowTracker(InsertedRowTracker tracker) {
+      this.keyType = tracker.keyType;
+      this.offsetsByKey = tracker.offsetsByKey;
     }
 
     /**
@@ -212,42 +226,248 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
     }
 
     /**
-     * Returns whether keys of the given struct type can be stored and looked up in this tracker.
+     * Returns whether writers whose equality-delete key has the given struct type can share this
+     * tracker.
      *
-     * <p>Keys are compared by position, type and optionality, which is what {@link StructLikeMap}
-     * uses; field names, docs and defaults may differ. Field IDs must match so that the two key
-     * types describe the same equality fields.
+     * <p>Key fields are matched by position, field ID and optionality, which together with the type
+     * is what {@link StructLikeMap} compares; field names, docs and defaults may differ. A key
+     * field's type may also differ by a type promotion, in either direction: int and long, float
+     * and double, or decimals of the same scale. A writer with such a key type converts its keys to
+     * this tracker's key type. A key with a nested field is only shared when its type matches
+     * exactly.
      */
-    public boolean acceptsKeyType(Types.StructType otherKeyType) {
+    public boolean canShareWith(Types.StructType otherKeyType) {
+      Preconditions.checkNotNull(otherKeyType, "Key type to share with cannot be null");
       List<Types.NestedField> fields = keyType.fields();
       List<Types.NestedField> otherFields = otherKeyType.fields();
       if (fields.size() != otherFields.size()) {
         return false;
       }
 
+      boolean promoted = false;
+      boolean nested = false;
       for (int pos = 0; pos < fields.size(); pos += 1) {
         Types.NestedField field = fields.get(pos);
         Types.NestedField otherField = otherFields.get(pos);
         if (field.fieldId() != otherField.fieldId()
-            || field.isOptional() != otherField.isOptional()
-            || !field.type().equals(otherField.type())) {
+            || field.isOptional() != otherField.isOptional()) {
           return false;
+        }
+
+        if (!field.type().equals(otherField.type())) {
+          if (!isPromotion(field.type(), otherField.type())) {
+            return false;
+          }
+
+          promoted = true;
+        }
+
+        nested = nested || field.type().isNestedType();
+      }
+
+      return !promoted || !nested;
+    }
+
+    /**
+     * Returns whether one of the two types promotes to the other. These are the promotions that
+     * {@code TypeUtil.isPromotionAllowed} allows; they are listed here because a view must convert
+     * the values of each, so one added there later is not shared until a view can convert it.
+     */
+    private static boolean isPromotion(Type type, Type otherType) {
+      switch (type.typeId()) {
+        case INTEGER:
+          return otherType.typeId() == Type.TypeID.LONG;
+        case LONG:
+          return otherType.typeId() == Type.TypeID.INTEGER;
+        case FLOAT:
+          return otherType.typeId() == Type.TypeID.DOUBLE;
+        case DOUBLE:
+          return otherType.typeId() == Type.TypeID.FLOAT;
+        case DECIMAL:
+          return otherType.typeId() == Type.TypeID.DECIMAL
+              && ((Types.DecimalType) type).scale() == ((Types.DecimalType) otherType).scale();
+        default:
+          return false;
+      }
+    }
+
+    /**
+     * Returns the tracker a writer with the given key type uses, which must be one this tracker
+     * {@link #canShareWith}: this tracker when the writer's keys hold values of the same classes,
+     * otherwise a view that converts them.
+     */
+    private InsertedRowTracker forKeyType(Types.StructType writerKeyType) {
+      List<Types.NestedField> fields = keyType.fields();
+      List<Types.NestedField> writerFields = writerKeyType.fields();
+      for (int pos = 0; pos < fields.size(); pos += 1) {
+        // decimals of the same scale compare and hash alike whatever their precision
+        if (fields.get(pos).type().typeId() != writerFields.get(pos).type().typeId()) {
+          return new PromotedKeyView(this, writerKeyType);
+        }
+      }
+
+      return this;
+    }
+
+    // Keyed by the key type with int and float fields widened to long and double
+    private Map<StructLike, PathOffset> widenedOffsetsByKey() {
+      if (widenedOffsetsByKey == null) {
+        List<Types.NestedField> widenedFields = Lists.newArrayList();
+        for (Types.NestedField field : keyType.fields()) {
+          widenedFields.add(
+              Types.NestedField.of(
+                  field.fieldId(), field.isOptional(), field.name(), widen(field.type())));
+        }
+
+        this.widenedOffsetsByKey = StructLikeMap.create(Types.StructType.of(widenedFields));
+      }
+
+      return widenedOffsetsByKey;
+    }
+
+    private static Type widen(Type type) {
+      switch (type.typeId()) {
+        case INTEGER:
+          return Types.LongType.get();
+        case FLOAT:
+          return Types.DoubleType.get();
+        default:
+          return type;
+      }
+    }
+
+    private void clear() {
+      offsetsByKey.clear();
+      this.widenedOffsetsByKey = null;
+    }
+
+    /** Records the position of the latest row written for the key, storing a copy of the key. */
+    PathOffset put(StructLike key, PathOffset offset) {
+      return offsetsByKey.put(StructLikeUtil.copy(key), offset);
+    }
+
+    PathOffset remove(StructLike key) {
+      return offsetsByKey.remove(key);
+    }
+  }
+
+  /**
+   * A writer's view of a tracker whose key type differs from the writer's by type promotions. Keys
+   * are converted to the tracker's key type when they have an exact value in it, otherwise to the
+   * widest type of each key field. Views never own the tracker they view and are never shared, so
+   * the state they inherit (the widened-offsets field, clear()) stays unused.
+   */
+  private static class PromotedKeyView extends InsertedRowTracker {
+    private final InsertedRowTracker tracker;
+    private final Type.TypeID[] writerTypes;
+    private final Type.TypeID[] trackerTypes;
+    private final KeyValues lookupKey;
+
+    private PromotedKeyView(InsertedRowTracker tracker, Types.StructType writerKeyType) {
+      super(tracker);
+      List<Types.NestedField> trackerFields = tracker.keyType().fields();
+      List<Types.NestedField> writerFields = writerKeyType.fields();
+      this.tracker = tracker;
+      this.writerTypes = new Type.TypeID[writerFields.size()];
+      this.trackerTypes = new Type.TypeID[writerFields.size()];
+      for (int pos = 0; pos < writerTypes.length; pos += 1) {
+        writerTypes[pos] = writerFields.get(pos).type().typeId();
+        trackerTypes[pos] = trackerFields.get(pos).type().typeId();
+      }
+
+      this.lookupKey = new KeyValues(writerTypes.length);
+    }
+
+    @Override
+    PathOffset put(StructLike key, PathOffset offset) {
+      KeyValues converted = new KeyValues(writerTypes.length);
+      if (toTrackerTypes(key, converted)) {
+        return tracker.offsetsByKey.put(converted, offset);
+      }
+
+      toWidenedTypes(key, converted);
+      return tracker.widenedOffsetsByKey().put(converted, offset);
+    }
+
+    @Override
+    PathOffset remove(StructLike key) {
+      if (toTrackerTypes(key, lookupKey)) {
+        return tracker.offsetsByKey.remove(lookupKey);
+      }
+
+      // only another promoted writer can have put a key without a value in the tracker's type
+      toWidenedTypes(key, lookupKey);
+      Map<StructLike, PathOffset> widenedOffsets = tracker.widenedOffsetsByKey;
+      return widenedOffsets != null ? widenedOffsets.remove(lookupKey) : null;
+    }
+
+    // Sets the key in the tracker's types; false if a value has no exact equivalent in them
+    private boolean toTrackerTypes(StructLike key, KeyValues converted) {
+      for (int pos = 0; pos < converted.size(); pos += 1) {
+        Object value = key.get(pos, Object.class);
+        if (value == null || writerTypes[pos] == trackerTypes[pos]) {
+          converted.set(pos, value);
+        } else if (writerTypes[pos] == Type.TypeID.INTEGER) {
+          converted.set(pos, ((Integer) value).longValue());
+        } else if (writerTypes[pos] == Type.TypeID.FLOAT) {
+          converted.set(pos, ((Float) value).doubleValue());
+        } else if (writerTypes[pos] == Type.TypeID.LONG) {
+          long longValue = (Long) value;
+          if (longValue != (int) longValue) {
+            return false;
+          }
+
+          converted.set(pos, (int) longValue);
+        } else {
+          double doubleValue = (Double) value;
+          // Double.compare treats NaN as equal to itself and keeps the sign of zero
+          if (Double.compare(doubleValue, (float) doubleValue) != 0) {
+            return false;
+          }
+
+          converted.set(pos, (float) doubleValue);
         }
       }
 
       return true;
     }
 
-    private void clear() {
-      offsetsByKey.clear();
+    // Sets the key with int and float values widened to long and double
+    private void toWidenedTypes(StructLike key, KeyValues converted) {
+      for (int pos = 0; pos < converted.size(); pos += 1) {
+        Object value = key.get(pos, Object.class);
+        if (value != null && writerTypes[pos] == Type.TypeID.INTEGER) {
+          converted.set(pos, ((Integer) value).longValue());
+        } else if (value != null && writerTypes[pos] == Type.TypeID.FLOAT) {
+          converted.set(pos, ((Float) value).doubleValue());
+        } else {
+          converted.set(pos, value);
+        }
+      }
+    }
+  }
+
+  // The values of a key converted for the tracker's maps
+  private static class KeyValues implements StructLike {
+    private final Object[] values;
+
+    private KeyValues(int size) {
+      this.values = new Object[size];
     }
 
-    private PathOffset put(StructLike key, PathOffset offset) {
-      return offsetsByKey.put(key, offset);
+    @Override
+    public int size() {
+      return values.length;
     }
 
-    private PathOffset remove(StructLike key) {
-      return offsetsByKey.remove(key);
+    @Override
+    public <V> V get(int pos, Class<V> javaClass) {
+      return javaClass.cast(values[pos]);
+    }
+
+    @Override
+    public <V> void set(int pos, V value) {
+      values[pos] = value;
     }
   }
 
@@ -288,8 +508,8 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
      * Creates an equality delta writer that records inserted rows in a shared tracker.
      *
      * @param sharedInsertedRows a tracker shared with other writers of the same table within the
-     *     current commit, or null to use a private tracker. It must accept the equality-delete
-     *     schema's struct type as key type, see {@link InsertedRowTracker#acceptsKeyType}.
+     *     current commit, or null to use a private tracker. It must be shareable with the
+     *     equality-delete schema's struct type, see {@link InsertedRowTracker#canShareWith}.
      */
     protected BaseEqualityDeltaWriter(
         StructLike partition,
@@ -301,8 +521,8 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
       Preconditions.checkNotNull(schema, "Iceberg table schema cannot be null.");
       Preconditions.checkNotNull(deleteSchema, "Equality-delete schema cannot be null.");
       Preconditions.checkArgument(
-          sharedInsertedRows == null || sharedInsertedRows.acceptsKeyType(deleteSchema.asStruct()),
-          "Shared inserted-row tracker key type %s must match equality-delete schema %s",
+          sharedInsertedRows == null || sharedInsertedRows.canShareWith(deleteSchema.asStruct()),
+          "Shared inserted-row tracker key type %s cannot be shared with equality-delete schema %s",
           sharedInsertedRows != null ? sharedInsertedRows.keyType() : null,
           deleteSchema.asStruct());
       this.structProjection = StructProjection.create(schema, deleteSchema);
@@ -318,7 +538,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
       this.insertedRows =
           ownsInsertedRows
               ? InsertedRowTracker.create(deleteSchema.asStruct())
-              : sharedInsertedRows;
+              : sharedInsertedRows.forKeyType(deleteSchema.asStruct());
       this.partitionKey = partition;
     }
 
@@ -331,11 +551,8 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
     public void write(T row) throws IOException {
       PathOffset pathOffset = PathOffset.of(dataWriter.currentPath(), dataWriter.currentRows());
 
-      // Create a copied key from this row.
-      StructLike copiedKey = StructLikeUtil.copy(structProjection.wrap(asStructLike(row)));
-
-      // Adding a pos-delete to replace the old path-offset.
-      PathOffset previous = insertedRows.put(copiedKey, pathOffset);
+      // Adding a pos-delete to replace the old path-offset. The tracker stores a copy of the key.
+      PathOffset previous = insertedRows.put(structProjection.wrap(asStructLike(row)), pathOffset);
       if (previous != null) {
         // TODO attach the previous row if has a positional-delete row schema in appender factory.
         writePosDelete(previous);
