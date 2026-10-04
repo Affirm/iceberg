@@ -468,12 +468,12 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     dynamicWriter.write(upsertRecord(table, schemaAfter, rowData(1, "after", "x")), null);
     dynamicWriter.write(upsertRecord(table, schemaAfter, rowData(2, "changed", "y")), null);
 
-    Object group = onlyTrackerGroup(dynamicWriter);
-    assertThat((Map<?, ?>) hiddenField(group, "byPartition")).hasSize(2);
-    assertThat((Set<?>) hiddenField(group, "sharingSchemaIds"))
+    Object trackers = tableTrackers(dynamicWriter);
+    assertThat((Map<?, ?>) hiddenField(trackers, "byPartition")).hasSize(2);
+    assertThat((Set<?>) hiddenField(trackers, "sharingSchemaIds"))
         .as("The second writer was handed the first writer's trackers")
         .isEqualTo(Sets.newHashSet(schemaAfter.schemaId()));
-    assertThat((Boolean) hiddenField(group, "warnedPartitionTypes")).isFalse();
+    assertThat((Boolean) hiddenField(trackers, "warnedPartitionTypes")).isFalse();
 
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(results).hasSize(2);
@@ -1063,8 +1063,7 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
   }
 
   @Test
-  void testUpsertAcrossKeyOptionalityChangeSharesOnlyBetweenWritersOfTheSameKeyType()
-      throws Exception {
+  void testUpsertAcrossKeyOptionalityChangeKeepsPrivateTrackersWithinCheckpoint() throws Exception {
     Catalog catalog = CATALOG_EXTENSION.catalog();
     Table table = catalog.createTable(TABLE1, REQUIRED_KEY_SCHEMA);
     DynamicWriter dynamicWriter = createDynamicWriter(catalog);
@@ -1072,9 +1071,9 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     dynamicWriter.write(
         upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "first")), null);
 
-    // A required key compares nulls differently from an optional one, so the writer of the schema
-    // that made the key optional cannot share the first writer's tracker. The writer of the next
-    // schema has the same optional key and shares the second writer's tracker.
+    // A required key compares nulls differently from an optional one, so the writers of the
+    // schemas after the key was made optional cannot share the first writer's trackers. Each keeps
+    // a private tracker, so they do not retire each other's rows either.
     table.updateSchema().makeColumnOptional("id").commit();
     Schema optionalKey = table.schema();
     dynamicWriter.write(
@@ -1082,20 +1081,25 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     dynamicWriter.write(
         upsertRecord(table, optionalKey, SimpleDataUtil.createRowData(10, "before")), null);
     table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
-    dynamicWriter.write(upsertRecord(table, table.schema(), rowData(10, "after", "x")), null);
-    assertThat(trackerGroups(dynamicWriter)).hasSize(2);
+    Schema extraColumn = table.schema();
+    dynamicWriter.write(upsertRecord(table, extraColumn, rowData(10, "after", "x")), null);
+
+    Object trackers = tableTrackers(dynamicWriter);
+    assertThat((Set<?>) hiddenField(trackers, "privateSchemaIds"))
+        .isEqualTo(Sets.newHashSet(optionalKey.schemaId(), extraColumn.schemaId()));
+    assertThat((Set<?>) hiddenField(trackers, "sharingSchemaIds")).isEmpty();
 
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(deleteFiles(results))
-        .as("Only the writers of the optional key retire each other's rows")
         .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
-        .hasSize(1);
+        .isEmpty();
 
     commit(table, results);
     assertTableRows(
         table,
         SimpleDataUtil.createRecord(1, "first", null),
         SimpleDataUtil.createRecord(1, "second", null),
+        SimpleDataUtil.createRecord(10, "before", null),
         SimpleDataUtil.createRecord(10, "after", "x"));
 
     dynamicWriter.close();
@@ -1168,17 +1172,11 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     return trackersField.get();
   }
 
-  // The tracker groups of the only table the writer has trackers for
-  private static List<?> trackerGroups(DynamicWriter dynamicWriter) {
+  // The trackers of the only table the writer has trackers for
+  private static Object tableTrackers(DynamicWriter dynamicWriter) {
     Map<?, ?> trackers = insertedRowTrackers(dynamicWriter);
     assertThat(trackers).hasSize(1);
-    return (List<?>) trackers.values().iterator().next();
-  }
-
-  private static Object onlyTrackerGroup(DynamicWriter dynamicWriter) {
-    List<?> groups = trackerGroups(dynamicWriter);
-    assertThat(groups).hasSize(1);
-    return groups.get(0);
+    return trackers.values().iterator().next();
   }
 
   private static Object hiddenField(Object target, String name) {
@@ -1189,10 +1187,10 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
   // and no writer was handed a tracker of another writer, so no "share" message is logged
   private static void assertSeparatePartitionTrackers(
       DynamicWriter dynamicWriter, int partitionTrackers) {
-    Object group = onlyTrackerGroup(dynamicWriter);
-    assertThat((Map<?, ?>) hiddenField(group, "byPartition")).hasSize(partitionTrackers);
-    assertThat((Boolean) hiddenField(group, "warnedPartitionTypes")).isTrue();
-    assertThat((Set<?>) hiddenField(group, "sharingSchemaIds")).isEmpty();
+    Object trackers = tableTrackers(dynamicWriter);
+    assertThat((Map<?, ?>) hiddenField(trackers, "byPartition")).hasSize(partitionTrackers);
+    assertThat((Boolean) hiddenField(trackers, "warnedPartitionTypes")).isTrue();
+    assertThat((Set<?>) hiddenField(trackers, "sharingSchemaIds")).isEmpty();
   }
 
   private static Collection<DynamicWriteResult> resultsFor(

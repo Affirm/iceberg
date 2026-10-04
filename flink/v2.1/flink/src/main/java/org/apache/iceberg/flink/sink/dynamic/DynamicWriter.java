@@ -66,8 +66,9 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
   // within the current checkpoint. A schema evolution mid-checkpoint opens another writer for the
   // same table; without a shared tracker its re-writes of keys already written by the earlier
   // writer would produce equality deletes at the same sequence number as their targets, which
-  // never apply. Writers whose key types cannot share a tracker go to separate groups.
-  private final Map<WriteTarget, List<TrackerGroup>> insertedRowTrackers;
+  // never apply. A writer whose key type cannot share the first writer's trackers keeps a private
+  // tracker.
+  private final Map<WriteTarget, TableTrackers> insertedRowTrackers;
   private final Configuration flinkConfig;
   private final Map<String, String> commonWriteProperties;
   private final DynamicWriterMetrics metrics;
@@ -172,16 +173,37 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
       WriteTarget trackerScope,
       StructLike partition,
       Types.StructType keyType) {
-    List<TrackerGroup> groups =
-        insertedRowTrackers.computeIfAbsent(trackerScope, scope -> Lists.newArrayList());
-    TrackerGroup group = trackerGroup(groups, writeTarget, keyType, partition);
     Integer schemaId = writeTarget.schemaId();
-    PartitionTracker partitionTracker = group.byPartition.get(partition);
+    TableTrackers trackers =
+        insertedRowTrackers.computeIfAbsent(
+            trackerScope, scope -> new TableTrackers(keyType, schemaId, partition));
+    if (!trackers.firstTracker.canShareWith(keyType)) {
+      if (trackers.privateSchemaIds.add(schemaId)) {
+        LOG.warn(
+            "Not sharing inserted-row tracker for table {} branch {}: key type {} of the writer "
+                + "for schema ID {} cannot share the trackers of the table's first writer {} (an "
+                + "equality field's optionality or position changed, its type changed in a way a "
+                + "shared tracker cannot convert, or the table's identifier fields, used as "
+                + "equality fields, changed). The writer keeps a private tracker. Re-writes of a "
+                + "key across these schema versions within one checkpoint will produce equality "
+                + "deletes that cannot apply to data written in the same commit",
+            writeTarget.tableName(),
+            writeTarget.branch(),
+            keyType,
+            schemaId,
+            trackers);
+      }
+
+      return null;
+    }
+
+    trackers.schemaIds.add(schemaId);
+    PartitionTracker partitionTracker = trackers.byPartition.get(partition);
     if (partitionTracker == null) {
-      warnIfPartitionValuesChangedType(group, writeTarget, partition);
-      partitionTracker = group.addPartition(partition, schemaId);
+      warnIfPartitionValuesChangedType(trackers, writeTarget, partition);
+      partitionTracker = trackers.addPartition(partition, schemaId);
     } else if (!partitionTracker.schemaId.equals(schemaId)
-        && group.sharingSchemaIds.add(schemaId)) {
+        && trackers.sharingSchemaIds.add(schemaId)) {
       LOG.info(
           "Writers for schema IDs {} and {} of table {} branch {} share an inserted-row tracker "
               + "within one checkpoint (spec ID {}, subtask {}, attempt {}), so re-writes of a key "
@@ -198,54 +220,13 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
     return partitionTracker.tracker;
   }
 
-  // Returns the group of the writer for the target, joining or opening one on its first lookup
-  private TrackerGroup trackerGroup(
-      List<TrackerGroup> groups,
-      WriteTarget writeTarget,
-      Types.StructType keyType,
-      StructLike partition) {
-    Integer schemaId = writeTarget.schemaId();
-    for (TrackerGroup group : groups) {
-      if (group.schemaIds.contains(schemaId)) {
-        return group;
-      }
-    }
-
-    for (TrackerGroup group : groups) {
-      if (group.firstTracker.canShareWith(keyType)) {
-        group.schemaIds.add(schemaId);
-        return group;
-      }
-    }
-
-    if (!groups.isEmpty()) {
-      LOG.warn(
-          "Not sharing inserted-row tracker for table {} branch {}: key type {} of the new writer "
-              + "for schema ID {} cannot share the trackers of the earlier writers {} (an equality "
-              + "field's optionality or position changed, its type changed in a way a shared "
-              + "tracker cannot convert, or the table's identifier fields, used as equality "
-              + "fields, changed). Re-writes of a key across these schema versions within one "
-              + "checkpoint will produce equality deletes that cannot apply to data written in "
-              + "the same commit",
-          writeTarget.tableName(),
-          writeTarget.branch(),
-          keyType,
-          schemaId,
-          groups);
-    }
-
-    TrackerGroup group = new TrackerGroup(keyType, schemaId, partition);
-    groups.add(group);
-    return group;
-  }
-
   private void warnIfPartitionValuesChangedType(
-      TrackerGroup group, WriteTarget writeTarget, StructLike partition) {
+      TableTrackers trackers, WriteTarget writeTarget, StructLike partition) {
     // Promoting the source column of an identity or truncate partition field turns its values
     // from Integer to Long, or Float to Double, so the same partition gets two partition keys
     StructLike earlier =
-        group.partitionsByWidenedValues.putIfAbsent(widenedValues(partition), partition);
-    if (earlier != null && !group.warnedPartitionTypes) {
+        trackers.partitionsByWidenedValues.putIfAbsent(widenedValues(partition), partition);
+    if (earlier != null && !trackers.warnedPartitionTypes) {
       LOG.warn(
           "Partition {} of table {} branch {} has the values of partition {} of an earlier writer "
               + "within one checkpoint in other types, because a partition source column was "
@@ -255,29 +236,32 @@ class DynamicWriter implements CommittingSinkWriter<DynamicRecordInternal, Dynam
           writeTarget.tableName(),
           writeTarget.branch(),
           earlier);
-      group.warnedPartitionTypes = true;
+      trackers.warnedPartitionTypes = true;
     }
   }
 
   /**
-   * Inserted-row trackers of one table within one checkpoint, one per partition, shared by the
-   * writers whose key types can share them. The trackers are keyed by the key type of the group's
-   * first writer; writers with a promoted key type convert their keys.
+   * Inserted-row trackers of one table within one checkpoint, one per partition, keyed by the key
+   * type of the table's first writer. They are shared by the writers whose key types the first
+   * tracker can share with; writers with a promoted key type convert their keys. The other writers
+   * keep private trackers.
    */
-  private static class TrackerGroup {
-    // The first writer's tracker, for its first partition; it decides which key types can join
+  private static class TableTrackers {
+    // The first writer's tracker, for its first partition; it decides which key types can share
     private final InsertedRowTracker firstTracker;
+    // Schema IDs of the writers that share the trackers
     private final Set<Integer> schemaIds = Sets.newLinkedHashSet();
     // Schema IDs of the writers that were handed a tracker another writer created
     private final Set<Integer> sharingSchemaIds = Sets.newHashSet();
+    // Schema IDs of the writers whose key types cannot share the trackers
+    private final Set<Integer> privateSchemaIds = Sets.newHashSet();
     private final Map<StructLike, PartitionTracker> byPartition = Maps.newHashMap();
     // The first partition seen with each partition's values widened to long and double
     private final Map<List<Object>, StructLike> partitionsByWidenedValues = Maps.newHashMap();
     private boolean warnedPartitionTypes = false;
 
-    private TrackerGroup(Types.StructType keyType, Integer schemaId, StructLike partition) {
+    private TableTrackers(Types.StructType keyType, Integer schemaId, StructLike partition) {
       this.firstTracker = InsertedRowTracker.create(keyType);
-      schemaIds.add(schemaId);
       byPartition.put(partition, new PartitionTracker(firstTracker, schemaId));
       partitionsByWidenedValues.put(widenedValues(partition), partition);
     }
