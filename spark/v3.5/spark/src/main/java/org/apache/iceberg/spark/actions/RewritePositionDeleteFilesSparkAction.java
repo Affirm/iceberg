@@ -50,6 +50,7 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -82,7 +83,9 @@ public class RewritePositionDeleteFilesSparkAction
           MAX_CONCURRENT_FILE_GROUP_REWRITES,
           PARTIAL_PROGRESS_ENABLED,
           PARTIAL_PROGRESS_MAX_COMMITS,
-          REWRITE_JOB_ORDER);
+          REWRITE_JOB_ORDER,
+          VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+          RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
   private static final Result EMPTY_RESULT =
       ImmutableRewritePositionDeleteFiles.Result.builder().build();
 
@@ -95,6 +98,8 @@ public class RewritePositionDeleteFilesSparkAction
   private boolean partialProgressEnabled;
   private RewriteJobOrder rewriteJobOrder;
   private boolean caseSensitive;
+  private boolean validateDuplicateFileRegistrations;
+  private boolean resolveDuplicateFileRegistrations;
 
   RewritePositionDeleteFilesSparkAction(SparkSession spark, Table table) {
     super(spark);
@@ -123,6 +128,10 @@ public class RewritePositionDeleteFilesSparkAction
 
     validateAndInitOptions();
 
+    if (validateDuplicateFileRegistrations) {
+      validateNoDuplicateFileRegistrations();
+    }
+
     StructLikeMap<List<List<PositionDeletesScanTask>>> fileGroupsByPartition = planFileGroups();
     RewriteExecutionContext ctx = new RewriteExecutionContext(fileGroupsByPartition);
 
@@ -138,6 +147,26 @@ public class RewritePositionDeleteFilesSparkAction
     } else {
       return doExecute(ctx, groupStream, commitManager());
     }
+  }
+
+  /**
+   * AFFIRM: delegates to {@link DuplicateFileRegistrationGuard}, shared with {@link
+   * RewriteDataFilesSparkAction} and {@link RemoveDanglingDeletesSparkAction} -- the same
+   * duplicate-registration defect is reachable through any of the three, since all commit through
+   * {@code ManifestFilterManager}. This action in particular is run standalone in production
+   * oncall/backfill notebooks with no dependency on {@code rewrite_data_files} ever having run
+   * against the same table, so it needs the identical guard rather than assuming that action
+   * already covered it.
+   */
+  @VisibleForTesting
+  void validateNoDuplicateFileRegistrations() {
+    DuplicateFileRegistrationGuard.validateOrRepair(
+        spark(),
+        table,
+        validateDuplicateFileRegistrations,
+        resolveDuplicateFileRegistrations,
+        VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+        RESOLVE_DUPLICATE_FILE_REGISTRATIONS);
   }
 
   private StructLikeMap<List<List<PositionDeletesScanTask>>> planFileGroups() {
@@ -390,6 +419,18 @@ public class RewritePositionDeleteFilesSparkAction
     this.rewriteJobOrder =
         RewriteJobOrder.fromName(
             PropertyUtil.propertyAsString(options(), REWRITE_JOB_ORDER, REWRITE_JOB_ORDER_DEFAULT));
+
+    this.validateDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS,
+            VALIDATE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
+
+    this.resolveDuplicateFileRegistrations =
+        PropertyUtil.propertyAsBoolean(
+            options(),
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS,
+            RESOLVE_DUPLICATE_FILE_REGISTRATIONS_DEFAULT);
 
     Preconditions.checkArgument(
         maxConcurrentFileGroupRewrites >= 1,
