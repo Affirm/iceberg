@@ -29,6 +29,7 @@ import java.nio.file.Paths;
 import java.util.List;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
+import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.collect.Streams;
 import org.junit.jupiter.api.Test;
@@ -37,6 +38,8 @@ import org.junit.jupiter.api.extension.ExtendWith;
 
 @ExtendWith(ParameterizedTestExtension.class)
 public class TestSnapshotProducer extends TestBase {
+
+  private static final String CHECKPOINT_PROP = "test-checkpoint-id";
 
   @Test
   public void testManifestFileGroupSize() {
@@ -242,5 +245,128 @@ public class TestSnapshotProducer extends TestBase {
 
     ManifestFile manifest = table.currentSnapshot().dataManifests(table.io()).get(0);
     assertThat(readAvroCodec(new File(manifest.path()))).isEqualTo("snappy");
+  }
+
+  @TestTemplate
+  public void committedSnapshotFilesKeptWhenRetryValidationFailsAfterAppliedCommit() {
+    // The catalog applies the first commit attempt but the client gets a CommitFailedException
+    // (e.g. a 409 for a lost or replayed request). The retry's apply() refreshes, sees its own
+    // snapshot, and the validator rejects it, as DynamicCommitter's
+    // MaxCommittedCheckpointIdValidator does. The snapshot is on the table, so its manifest list
+    // and manifests must survive.
+    String tableName = "applied-then-commit-failed";
+    TestTables.TestTableOperations ops = opsWithCommitAppliedThenFailed(tableName, tableDir);
+    TestTables.TestTable appliedTable =
+        TestTables.create(
+            tableDir, tableName, SCHEMA, SPEC, SortOrder.unsorted(), formatVersion, ops);
+
+    RowDelta rowDelta =
+        appliedTable
+            .newRowDelta()
+            .addRows(FILE_A)
+            .set(CHECKPOINT_PROP, "1")
+            .validateWith(rejectCheckpoint("1"));
+
+    assertThatThrownBy(rowDelta::commit)
+        .isInstanceOf(ValidationException.class)
+        .hasMessageStartingWith("Snapshot ancestry validation failed");
+
+    Snapshot committed = appliedTable.ops().refresh().currentSnapshot();
+    assertThat(committed).isNotNull();
+    assertThat(committed.summary()).containsEntry(CHECKPOINT_PROP, "1");
+    assertThat(new File(committed.manifestListLocation()))
+        .as("Manifest list of the committed snapshot must not be deleted")
+        .exists();
+    assertThat(committed.allManifests(appliedTable.io()))
+        .isNotEmpty()
+        .allSatisfy(
+            manifest ->
+                assertThat(new File(manifest.path()))
+                    .as("Manifests of the committed snapshot must not be deleted")
+                    .exists());
+  }
+
+  @TestTemplate
+  public void uncommittedFilesKeptWhenRetryValidationFailsAfterConcurrentCommit() {
+    // The first attempt loses to another writer that commits the same checkpoint. The retry's
+    // validator rejects, our snapshot is not on the table. A failed commit never deletes files, so
+    // the failed attempt's manifest list and manifests remain as leaked files.
+    String tableName = "concurrent-writer-commits-first";
+    Runnable[] otherWriter = new Runnable[1];
+    TestTables.TestTableOperations ops =
+        opsWithHookBeforeFirstCommit(tableName, tableDir, () -> otherWriter[0].run());
+    TestTables.TestTable contendedTable =
+        TestTables.create(
+            tableDir, tableName, SCHEMA, SPEC, SortOrder.unsorted(), formatVersion, ops);
+    otherWriter[0] =
+        () -> contendedTable.newFastAppend().appendFile(FILE_B).set(CHECKPOINT_PROP, "1").commit();
+
+    RowDelta rowDelta =
+        contendedTable
+            .newRowDelta()
+            .addRows(FILE_A)
+            .set(CHECKPOINT_PROP, "1")
+            .validateWith(rejectCheckpoint("1"));
+
+    assertThatThrownBy(rowDelta::commit)
+        .isInstanceOf(ValidationException.class)
+        .hasMessageStartingWith("Snapshot ancestry validation failed");
+
+    Snapshot other = contendedTable.ops().refresh().currentSnapshot();
+    assertThat(contendedTable.snapshots()).hasSize(1);
+
+    List<File> otherManifests =
+        other.allManifests(contendedTable.io()).stream()
+            .map(manifest -> new File(manifest.path()))
+            .collect(Collectors.toList());
+    assertThat(listManifestLists(tableDir))
+        .as("The failed attempt's manifest list must remain next to the other writer's")
+        .hasSize(2)
+        .contains(new File(other.manifestListLocation()));
+    assertThat(listManifestFiles(tableDir))
+        .as("The failed attempt's manifests must remain next to the other writer's")
+        .hasSizeGreaterThan(otherManifests.size())
+        .containsAll(otherManifests);
+  }
+
+  private static SnapshotAncestryValidator rejectCheckpoint(String checkpointId) {
+    return baseSnapshots ->
+        Streams.stream(baseSnapshots)
+            .noneMatch(snapshot -> checkpointId.equals(snapshot.summary().get(CHECKPOINT_PROP)));
+  }
+
+  /** Applies the first commit, then reports it as failed, as a lost or replayed 409 would. */
+  private static TestTables.TestTableOperations opsWithCommitAppliedThenFailed(
+      String name, File location) {
+    return new TestTables.TestTableOperations(name, location) {
+      private boolean failedOnce = false;
+
+      @Override
+      public void commit(TableMetadata base, TableMetadata updatedMetadata) {
+        super.commit(base, updatedMetadata);
+        if (base != null && !failedOnce) {
+          this.failedOnce = true;
+          throw new CommitFailedException("Requirement failed: branch main has changed");
+        }
+      }
+    };
+  }
+
+  /** Runs a hook (another writer's commit) before the first snapshot commit is evaluated. */
+  private static TestTables.TestTableOperations opsWithHookBeforeFirstCommit(
+      String name, File location, Runnable hook) {
+    return new TestTables.TestTableOperations(name, location) {
+      private boolean hookRun = false;
+
+      @Override
+      public void commit(TableMetadata base, TableMetadata updatedMetadata) {
+        if (base != null && base.currentSnapshot() == null && !hookRun) {
+          this.hookRun = true;
+          hook.run();
+        }
+
+        super.commit(base, updatedMetadata);
+      }
+    };
   }
 }

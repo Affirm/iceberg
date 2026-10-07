@@ -2529,7 +2529,7 @@ public class TestRESTCatalog extends CatalogTests<RESTCatalog> {
   }
 
   @Test
-  public void testCleanupUncommitedFilesForCleanableFailures() {
+  public void testNoCleanupUncommittedFilesForCleanableFailures() {
     RESTCatalogAdapter adapter = Mockito.spy(new RESTCatalogAdapter(backendCatalog));
     RESTCatalog catalog = catalog(adapter);
 
@@ -2553,8 +2553,8 @@ public class TestRESTCatalog extends CatalogTests<RESTCatalog> {
         .isInstanceOf(NotAuthorizedException.class)
         .hasMessage("not authorized");
 
-    // Extract the UpdateTableRequest to determine the path of the manifest list that should be
-    // cleaned up
+    // Extract the UpdateTableRequest to determine the path of the manifest list that should still
+    // exist: a failed snapshot commit never deletes files, even for cleanable failures
     assertThat(allRequests(adapter))
         .anySatisfy(
             req -> {
@@ -2564,10 +2564,12 @@ public class TestRESTCatalog extends CatalogTests<RESTCatalog> {
               UpdateTableRequest body = (UpdateTableRequest) req.body();
               MetadataUpdate.AddSnapshot addSnapshot =
                   (MetadataUpdate.AddSnapshot) body.updates().get(0);
-              assertThatThrownBy(
-                      () -> table.io().newInputFile(addSnapshot.snapshot().manifestListLocation()))
-                  .isInstanceOf(NotFoundException.class)
-                  .hasMessageContaining("No in-memory file found");
+              assertThat(
+                      table
+                          .io()
+                          .newInputFile(addSnapshot.snapshot().manifestListLocation())
+                          .exists())
+                  .isTrue();
             });
   }
 
