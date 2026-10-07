@@ -287,9 +287,10 @@ public class TestSnapshotProducer extends TestBase {
   }
 
   @TestTemplate
-  public void uncommittedFilesCleanedUpWhenRetryValidationFailsAfterConcurrentCommit() {
+  public void uncommittedFilesKeptWhenRetryValidationFailsAfterConcurrentCommit() {
     // The first attempt loses to another writer that commits the same checkpoint. The retry's
-    // validator rejects, our snapshot is not on the table, so its files must be cleaned up.
+    // validator rejects, our snapshot is not on the table. A failed commit never deletes files, so
+    // the failed attempt's manifest list and manifests remain as leaked files.
     String tableName = "concurrent-writer-commits-first";
     Runnable[] otherWriter = new Runnable[1];
     TestTables.TestTableOperations ops =
@@ -313,15 +314,19 @@ public class TestSnapshotProducer extends TestBase {
 
     Snapshot other = contendedTable.ops().refresh().currentSnapshot();
     assertThat(contendedTable.snapshots()).hasSize(1);
+
+    List<File> otherManifests =
+        other.allManifests(contendedTable.io()).stream()
+            .map(manifest -> new File(manifest.path()))
+            .collect(Collectors.toList());
     assertThat(listManifestLists(tableDir))
-        .as("Only the other writer's manifest list may remain")
-        .containsExactly(new File(other.manifestListLocation()));
+        .as("The failed attempt's manifest list must remain next to the other writer's")
+        .hasSize(2)
+        .contains(new File(other.manifestListLocation()));
     assertThat(listManifestFiles(tableDir))
-        .as("Only the other writer's manifests may remain")
-        .containsExactlyInAnyOrderElementsOf(
-            other.allManifests(contendedTable.io()).stream()
-                .map(manifest -> new File(manifest.path()))
-                .collect(Collectors.toList()));
+        .as("The failed attempt's manifests must remain next to the other writer's")
+        .hasSizeGreaterThan(otherManifests.size())
+        .containsAll(otherManifests);
   }
 
   private static SnapshotAncestryValidator rejectCheckpoint(String checkpointId) {

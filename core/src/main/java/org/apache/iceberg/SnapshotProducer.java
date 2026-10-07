@@ -52,7 +52,6 @@ import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.encryption.EncryptingFileIO;
 import org.apache.iceberg.events.CreateSnapshotEvent;
 import org.apache.iceberg.events.Listeners;
-import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.RuntimeIOException;
@@ -72,7 +71,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.relocated.com.google.common.math.IntMath;
-import org.apache.iceberg.util.Exceptions;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SnapshotUtil;
@@ -106,7 +104,6 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   private final LoadingCache<ManifestFile, ManifestFile> manifestsWithMetadata;
 
   private final TableOperations ops;
-  private final boolean strictCleanup;
   private final boolean canInheritSnapshotId;
   private final String commitUUID = UUID.randomUUID().toString();
   private final AtomicInteger manifestCount = new AtomicInteger(0);
@@ -128,7 +125,6 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
 
   protected SnapshotProducer(TableOperations ops) {
     this.ops = ops;
-    this.strictCleanup = ops.requireStrictCleanup();
     this.base = ops.current();
     this.manifestsWithMetadata =
         Caffeine.newBuilder()
@@ -504,10 +500,10 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
       } catch (CommitStateUnknownException commitStateUnknownException) {
         throw commitStateUnknownException;
       } catch (RuntimeException e) {
-        if (!strictCleanup || e instanceof CleanableFailure) {
-          Exceptions.suppressAndThrow(e, this::cleanAll);
-        }
-
+        // do not delete files on failure. a failed commit may still have been applied by the
+        // catalog (e.g. a lost or replayed request), and a committed snapshot must keep its
+        // manifest list and manifests. leaked files are left to orphan file removal.
+        LOG.warn("Commit failed, leaving manifest lists in place: {}", manifestLists, e);
         throw e;
       }
 
