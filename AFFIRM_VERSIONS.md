@@ -8,6 +8,14 @@ Format: one section per published version, listing its upstream base and every A
 carried on top, each linked to its upstream reference where one exists. The git tag for a version
 is the source of truth for the commit published to Artifactory.
 
+## 1.11.0-affirm-patch.3
+
+- **Base:** `1.11.0-affirm-patch.2`
+
+| Fork PR | Upstream reference | Scope |
+|---|---|---|
+| [Affirm/iceberg#17](https://github.com/Affirm/iceberg/pull/17) | apache/iceberg#18262 | Share the inserted-row tracker across `DynamicIcebergSink` writers of one table, so a mid-checkpoint schema change no longer leaves a row visible twice; `flink/v2.1`, `flink/v2.0` |
+
 ## 1.11.0-affirm-patch.2
 
 - **Base:** `1.11.0-affirm-patch.1`
