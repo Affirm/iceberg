@@ -20,7 +20,7 @@ volumes:
 
 services:
   minio:
-    image: minio/minio
+    image: cgr.dev/chainguard/minio:latest
     hostname: minio
     environment:
       - MINIO_ROOT_USER=minioadmin
@@ -33,7 +33,7 @@ services:
     command: server /data --console-address ":9001"
 
   create-bucket:
-    image: minio/mc
+    image: cgr.dev/chainguard/minio-client:latest
     depends_on:
       - minio
     volumes:
