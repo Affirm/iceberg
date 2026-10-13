@@ -942,6 +942,66 @@ public class TestTaskEqualityDeltaWriter extends TestBase {
   }
 
   @TestTemplate
+  void testSharedInsertedRowTrackerAcrossPromotionKeepsKeysOfReusedRow() throws IOException {
+    List<Integer> equalityFieldIds = Lists.newArrayList(idFieldId, dataFieldId);
+    Schema narrowSchema = table.schema();
+    Schema narrowKey = narrowSchema.select("id", "data");
+    InsertedRowTracker sharedInsertedRows = InsertedRowTracker.create(narrowKey.asStruct());
+    GenericTaskDeltaWriter narrow =
+        createTaskWriter(equalityFieldIds, narrowKey, DeleteGranularity.FILE, sharedInsertedRows);
+
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    Schema wideSchema = table.schema();
+    Schema wideKey = wideSchema.select("id", "data");
+    GenericTaskDeltaWriter wide =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    GenericTaskDeltaWriter other =
+        createTaskWriter(equalityFieldIds, wideKey, DeleteGranularity.FILE, sharedInsertedRows);
+    long wideId = Integer.MAX_VALUE + 1L;
+
+    // the promoted writer is handed one record that is changed in place for every row, so the
+    // keys it stores must not be the row or the writer's reused key projection
+    Record reused = GenericRecord.create(wideSchema);
+    reused.setField("id", 1L);
+    reused.setField("data", "aaa");
+    wide.write(reused);
+    reused.setField("id", wideId);
+    reused.setField("data", "bbb");
+    wide.write(reused);
+    reused.setField("id", 2L);
+    reused.setField("data", "ccc");
+    wide.write(reused);
+
+    // keys converted to the tracker's types are found by the int-keyed writer
+    narrow.write(record(narrowSchema, 1, "aaa"));
+    narrow.deleteKey(record(narrowKey, 2, "ccc"));
+    // the key outside the int range is found by another promoted writer
+    other.write(record(wideSchema, wideId, "bbb"));
+
+    WriteResult wideResult = wide.complete();
+    WriteResult narrowResult = narrow.complete();
+    WriteResult otherResult = other.complete();
+    assertThat(narrowResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES)
+        .allMatch(file -> file.recordCount() == 2);
+    assertThat(narrowResult.referencedDataFiles())
+        .containsExactly(wideResult.dataFiles()[0].location());
+    assertThat(otherResult.deleteFiles())
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+    assertThat(otherResult.referencedDataFiles())
+        .containsExactly(wideResult.dataFiles()[0].location());
+
+    commit(wideResult, narrowResult, otherResult);
+    assertThat(actualRowSet("*"))
+        .isEqualTo(
+            expectedRowSet(
+                ImmutableList.of(
+                    record(table.schema(), 1L, "aaa"), record(table.schema(), wideId, "bbb"))));
+  }
+
+  @TestTemplate
   void testSharedInsertedRowTrackerAcrossFloatToDoubleKeyPromotion() throws IOException {
     table.updateSchema().addColumn("f", Types.FloatType.get()).commit();
     List<Integer> equalityFieldIds = Lists.newArrayList(table.schema().findField("f").fieldId());
