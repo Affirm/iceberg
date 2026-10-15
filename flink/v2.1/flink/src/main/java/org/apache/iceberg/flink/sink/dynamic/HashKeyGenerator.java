@@ -35,7 +35,6 @@ import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
-import org.apache.iceberg.flink.sink.EqualityFieldKeySelector;
 import org.apache.iceberg.flink.sink.PartitionKeySelector;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -200,7 +199,7 @@ class HashKeyGenerator {
       int writeParallelism,
       int maxWriteParallelism) {
     return new TargetLimitedKeySelector(
-        new EqualityFieldKeySelector(
+        new WidenedEqualityFieldKeySelector(
             schema,
             FlinkSchemaUtil.convert(schema),
             DynamicSinkUtil.getEqualityFieldIds(equalityFields, schema)),

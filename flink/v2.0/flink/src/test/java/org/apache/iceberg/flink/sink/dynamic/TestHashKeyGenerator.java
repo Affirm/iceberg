@@ -38,6 +38,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.FlinkWriteOptions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
@@ -161,6 +162,55 @@ class TestHashKeyGenerator {
     assertThat(getSubTaskId(writeKey1, writeParallelism, maxWriteParallelism)).isEqualTo(1);
     assertThat(getSubTaskId(writeKey2, writeParallelism, maxWriteParallelism)).isEqualTo(1);
     assertThat(getSubTaskId(writeKey3, writeParallelism, maxWriteParallelism)).isEqualTo(0);
+  }
+
+  @Test
+  void testEqualityFieldRoutingIsStableAcrossKeyPromotion() throws Exception {
+    int maxWriteParallelism = 8;
+    Schema narrow =
+        new Schema(
+            Lists.newArrayList(
+                Types.NestedField.required(1, "id", Types.IntegerType.get()),
+                Types.NestedField.required(2, "data", Types.StringType.get())),
+            Sets.newHashSet(1));
+    Schema wide =
+        new Schema(
+            Lists.newArrayList(
+                Types.NestedField.required(1, "id", Types.LongType.get()),
+                Types.NestedField.required(2, "data", Types.StringType.get())),
+            Sets.newHashSet(1));
+
+    // Rows of one key that arrive before and after promoting the key from int to long must reach
+    // the same writer, so that its writers can retire each other's rows of the key
+    for (DistributionMode mode : DistributionMode.values()) {
+      // equality fields drive NONE and unpartitioned HASH; RANGE uses the identifier fields
+      Set<String> equalityFields =
+          mode == DistributionMode.RANGE ? Collections.emptySet() : Collections.singleton("id");
+      for (int writeParallelism = 2; writeParallelism <= 4; writeParallelism += 1) {
+        HashKeyGenerator generator = new HashKeyGenerator(16, maxWriteParallelism);
+        for (int id : new int[] {Integer.MIN_VALUE, -5, -1, 0, 42}) {
+          int narrowKey =
+              generator.generateKey(
+                  record(
+                      narrow,
+                      GenericRowData.of(id, StringData.fromString("a")),
+                      mode,
+                      writeParallelism,
+                      equalityFields));
+          int wideKey =
+              generator.generateKey(
+                  record(
+                      wide,
+                      GenericRowData.of((long) id, StringData.fromString("b")),
+                      mode,
+                      writeParallelism,
+                      equalityFields));
+          assertThat(wideKey)
+              .as("Mode %s, write parallelism %s, key %s", mode, writeParallelism, id)
+              .isEqualTo(narrowKey);
+        }
+      }
+    }
   }
 
   @Test
@@ -538,6 +588,25 @@ class TestHashKeyGenerator {
 
     DynamicRecordWithConfig dynamicRecordWithConfig = new DynamicRecordWithConfig(flinkWriteConf);
     return generator.generateKey(dynamicRecordWithConfig.wrap(inputRecord));
+  }
+
+  private static DynamicRecord record(
+      Schema schema,
+      RowData row,
+      DistributionMode mode,
+      int writeParallelism,
+      Set<String> equalityFields) {
+    DynamicRecord record =
+        new DynamicRecord(
+            TABLE_IDENTIFIER,
+            BRANCH,
+            schema,
+            row,
+            PartitionSpec.unpartitioned(),
+            mode,
+            writeParallelism);
+    record.setEqualityFields(equalityFields);
+    return record;
   }
 
   private static int getSubTaskId(int writeKey1, int writeParallelism, int maxWriteParallelism) {
