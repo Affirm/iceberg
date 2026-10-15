@@ -180,6 +180,136 @@ public class TestIcebergFilesCommitter extends TestBase {
   }
 
   @TestTemplate
+  public void testDropAlreadyCommittedFilesDropsDuplicatePath() throws Exception {
+    // AFFIRM: regression test for apache/iceberg#10765. Simulates the production race directly:
+    // getMaxCommittedCheckpointId() is evaluated against stale catalog state and a checkpoint
+    // whose file was already committed gets bundled into a later commit attempt anyway.
+    // dropAlreadyCommittedFiles should catch it by path, independent of that metadata check.
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile("data-1", ImmutableList.of(row1));
+
+      long checkpointId = 1;
+      harness.processElement(of(checkpointId, dataFile1), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+
+      SimpleDataUtil.assertTableRows(table, ImmutableList.of(row1), branch);
+      assertSnapshotSize(1);
+      assertMaxCommittedCheckpointId(jobId, operatorId, checkpointId);
+
+      // Build a pendingResults map, as if for a subsequent commit attempt, that (incorrectly)
+      // still includes dataFile1 -- the exact shape of the production duplicate, where the same
+      // physical file got bundled into a commit whose checkpoint the dedup check believed was
+      // not yet committed -- alongside a genuinely new file that must NOT be dropped.
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile2 = writeDataFile("data-2", ImmutableList.of(row2));
+
+      NavigableMap<Long, WriteResult> pendingResults = Maps.newTreeMap();
+      pendingResults.put(2L, WriteResult.builder().addDataFiles(dataFile1, dataFile2).build());
+
+      IcebergFilesCommitter committer = (IcebergFilesCommitter) harness.getOperator();
+      NavigableMap<Long, WriteResult> deduped =
+          committer.dropAlreadyCommittedFiles(
+              pendingResults, jobId.toString(), operatorId.toHexString());
+
+      List<DataFile> remaining = Lists.newArrayList(deduped.get(2L).dataFiles());
+      assertThat(remaining).hasSize(1);
+      assertThat(remaining.get(0).location()).isEqualTo(dataFile2.location());
+    }
+  }
+
+  @TestTemplate
+  public void testDropAlreadyCommittedFilesKeepsUnrelatedFiles() throws Exception {
+    // Sanity check for the same method: when nothing in pendingResults was already committed,
+    // dropAlreadyCommittedFiles must be a no-op (return the input unchanged in content).
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile("data-1", ImmutableList.of(row1));
+      long checkpointId = 1;
+      harness.processElement(of(checkpointId, dataFile1), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile2 = writeDataFile("data-2", ImmutableList.of(row2));
+      NavigableMap<Long, WriteResult> pendingResults = Maps.newTreeMap();
+      pendingResults.put(2L, WriteResult.builder().addDataFiles(dataFile2).build());
+
+      IcebergFilesCommitter committer = (IcebergFilesCommitter) harness.getOperator();
+      NavigableMap<Long, WriteResult> deduped =
+          committer.dropAlreadyCommittedFiles(
+              pendingResults, jobId.toString(), operatorId.toHexString());
+
+      List<DataFile> remaining = Lists.newArrayList(deduped.get(2L).dataFiles());
+      assertThat(remaining).hasSize(1);
+      assertThat(remaining.get(0).location()).isEqualTo(dataFile2.location());
+    }
+  }
+
+  @TestTemplate
+  public void testVerifyCommitEventuallySucceeded() throws Exception {
+    // AFFIRM: regression test for the CommitStateUnknownException handling in commitOperation.
+    // Configure a fast, test-scale retry budget rather than the real default (5 attempts,
+    // starting at 1s, exponential backoff) so this doesn't take ~30s to run.
+    table
+        .updateProperties()
+        .set(IcebergFilesCommitter.COMMIT_STATE_UNKNOWN_MAX_VERIFY_ATTEMPTS_PROP, "2")
+        .set(IcebergFilesCommitter.COMMIT_STATE_UNKNOWN_VERIFY_INITIAL_DELAY_MS_PROP, "10")
+        .commit();
+
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      RowData row = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile = writeDataFile("data-1", ImmutableList.of(row));
+      long checkpointId = 1;
+      harness.processElement(of(checkpointId, dataFile), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+
+      assertMaxCommittedCheckpointId(jobId, operatorId, checkpointId);
+
+      IcebergFilesCommitter committer = (IcebergFilesCommitter) harness.getOperator();
+
+      // checkpointId really was committed -- must verify true.
+      assertThat(
+              committer.verifyCommitEventuallySucceeded(
+                  jobId.toString(), operatorId.toHexString(), checkpointId, "test"))
+          .isTrue();
+
+      // A checkpoint id that was never committed must exhaust the retry budget and report false,
+      // so commitOperation knows it's not safe to treat this as a no-op and must rethrow.
+      assertThat(
+              committer.verifyCommitEventuallySucceeded(
+                  jobId.toString(), operatorId.toHexString(), 999L, "test"))
+          .isFalse();
+    }
+  }
+
+  @TestTemplate
   public void testCommitTxn() throws Exception {
     // Test with 3 continues checkpoints:
     //   1. snapshotState for checkpoint#1
