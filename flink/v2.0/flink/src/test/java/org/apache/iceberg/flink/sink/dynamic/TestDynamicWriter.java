@@ -27,6 +27,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import org.apache.flink.configuration.Configuration;
@@ -66,6 +67,11 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
 
   private static final TableIdentifier TABLE1 = TableIdentifier.of("myTable1");
   private static final TableIdentifier TABLE2 = TableIdentifier.of("myTable2");
+  // An equality key that is not an identifier field can be made optional
+  private static final Schema REQUIRED_KEY_SCHEMA =
+      new Schema(
+          Types.NestedField.required(1, "id", Types.IntegerType.get()),
+          Types.NestedField.optional(2, "data", Types.StringType.get()));
 
   @Test
   void testDynamicWriter() throws Exception {
@@ -460,24 +466,33 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
     Schema schemaAfter = table.schema();
     dynamicWriter.write(upsertRecord(table, schemaAfter, rowData(1, "after", "x")), null);
+    dynamicWriter.write(upsertRecord(table, schemaAfter, rowData(2, "changed", "y")), null);
+
+    Object trackers = tableTrackers(dynamicWriter);
+    assertThat((Map<?, ?>) hiddenField(trackers, "byPartition")).hasSize(2);
+    assertThat((Set<?>) hiddenField(trackers, "sharingSchemaIds"))
+        .as("The second writer was handed the first writer's trackers")
+        .isEqualTo(Sets.newHashSet(schemaAfter.schemaId()));
+    assertThat((Boolean) hiddenField(trackers, "warnedPartitionTypes")).isFalse();
 
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(results).hasSize(2);
     assertThat(deleteFiles(results))
+        .as("One position delete per partition")
         .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
-        .hasSize(1);
+        .hasSize(2);
 
     commit(table, results);
     assertTableRows(
         table,
         SimpleDataUtil.createRecord(1, "after", "x"),
-        SimpleDataUtil.createRecord(2, "other", null));
+        SimpleDataUtil.createRecord(2, "changed", "y"));
 
     dynamicWriter.close();
   }
 
   @Test
-  void testUpsertAcrossEqualityFieldTypePromotionFallsBackToPrivateTracker() throws Exception {
+  void testUpsertAcrossEqualityFieldTypePromotionWithinCheckpoint() throws Exception {
     Catalog catalog = CATALOG_EXTENSION.catalog();
     Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
     DynamicWriter dynamicWriter = createDynamicWriter(catalog);
@@ -486,31 +501,28 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     dynamicWriter.write(
         upsertRecord(table, schemaBefore, SimpleDataUtil.createRowData(1, "before")), null);
 
-    // Promoting the equality field changes the tracker key type, so the writers cannot share a
-    // tracker. The second writer must still work, with a private tracker; the re-write is then
-    // retired by an equality delete, which cannot apply within this commit (documented limitation).
+    // Promoting the equality field from int to long gives the second writer a long key; it shares
+    // the first writer's tracker by converting its keys, so its re-write of key 1 is retired with
+    // a position delete.
     table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
     Schema schemaAfter = table.schema();
-    dynamicWriter.write(
-        upsertRecord(table, schemaAfter, GenericRowData.of(1L, StringData.fromString("after"))),
-        null);
+    dynamicWriter.write(upsertRecord(table, schemaAfter, longKeyRow(1L, "after")), null);
 
     Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
     assertThat(results).hasSize(2);
     assertThat(dataFiles(results)).hasSize(2);
     assertThat(deleteFiles(results))
-        .as("Each writer emits its own insert-time equality delete and no position delete")
-        .hasSize(2)
-        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+        .as("Only the first writer's insert of a key it had not seen emits an equality delete")
+        .filteredOn(file -> file.content() == FileContent.EQUALITY_DELETES)
+        .hasSize(1);
+
+    DynamicWriteResult firstWriter = resultWithDelete(results, FileContent.EQUALITY_DELETES);
+    DynamicWriteResult secondWriter = resultWithDelete(results, FileContent.POSITION_DELETES);
+    assertThat(secondWriter.writeResult().referencedDataFiles())
+        .containsExactly(firstWriter.writeResult().dataFiles()[0].location());
 
     commit(table, results);
-    Record before = GenericRecord.create(table.schema());
-    before.setField("id", 1L);
-    before.setField("data", "before");
-    Record after = GenericRecord.create(table.schema());
-    after.setField("id", 1L);
-    after.setField("data", "after");
-    assertTableRows(table, before, after);
+    assertTableRows(table, record(table, 1L, "after", null));
 
     dynamicWriter.close();
   }
@@ -706,6 +718,436 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
     dynamicWriter.close();
   }
 
+  @Test
+  void testUpsertAcrossSchemaChangeAfterKeyPromotionWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "other")), null);
+
+    // Key 10 is only ever written after the key promotion, by two writers with the same long key
+    // type. They must share a tracker even though the first writer of the table had an int key.
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    dynamicWriter.write(
+        upsertRecord(
+            table, table.schema(), GenericRowData.of(10L, StringData.fromString("before"))),
+        null);
+    table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
+    dynamicWriter.write(
+        upsertRecord(
+            table,
+            table.schema(),
+            GenericRowData.of(10L, StringData.fromString("after"), StringData.fromString("x"))),
+        null);
+
+    commit(table, dynamicWriter.prepareCommit());
+    assertTableRows(table, record(table, 1L, "other", null), record(table, 10L, "after", "x"));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertAcrossKeyPromotionAndAnotherSchemaChangeWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(9, "first")), null);
+
+    // Two schema changes in one checkpoint: the key promotion, then a new column. The writers of
+    // both later schemas have a long key and share the first writer's int-keyed tracker.
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(9L, "second")), null);
+    table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
+    dynamicWriter.write(
+        upsertRecord(
+            table,
+            table.schema(),
+            GenericRowData.of(9L, StringData.fromString("third"), StringData.fromString("x"))),
+        null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(results).hasSize(3);
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .hasSize(2);
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.EQUALITY_DELETES)
+        .hasSize(1);
+
+    commit(table, results);
+    assertTableRows(table, record(table, 9L, "third", "x"));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertAlternatingAcrossEqualityFieldTypePromotionWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    Schema narrow = table.schema();
+    dynamicWriter.write(upsertRecord(table, narrow, SimpleDataUtil.createRowData(1, "100")), null);
+
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(1L, "200")), null);
+
+    // An input still shaped like the old schema keeps its int key, so traffic can return to the
+    // int-keyed writer after the long-keyed one exists. The newest write must win.
+    dynamicWriter.write(upsertRecord(table, narrow, SimpleDataUtil.createRowData(1, "300")), null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(results).hasSize(2);
+    assertThat(deleteFiles(results))
+        .as("Each writer retires the other writer's row with a position delete")
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .hasSize(2);
+
+    commit(table, results);
+    assertTableRows(table, record(table, 1L, "300", null));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertThroughNarrowKeyWriterAfterWideKeyWriterWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    Schema narrow = table.schema();
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    // The first writer of the checkpoint has the long key, so the tracker is keyed by long and the
+    // later int-keyed writer converts its keys up.
+    dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(1L, "wide")), null);
+    dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(2L, "other")), null);
+    dynamicWriter.write(
+        upsertRecord(table, narrow, SimpleDataUtil.createRowData(1, "narrow")), null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .hasSize(1);
+
+    commit(table, results);
+    assertTableRows(table, record(table, 1L, "narrow", null), record(table, 2L, "other", null));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertOfKeyOutsideIntRangeAcrossWritersAfterKeyPromotion() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+    long wideKey = Integer.MAX_VALUE + 1L;
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "narrow")), null);
+
+    // A long key outside the int range has no value in the int-keyed tracker. Writers with long
+    // keys still find each other's rows for it.
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(wideKey, "before")), null);
+    table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
+    dynamicWriter.write(
+        upsertRecord(
+            table,
+            table.schema(),
+            GenericRowData.of(wideKey, StringData.fromString("after"), StringData.fromString("x"))),
+        null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .hasSize(1);
+
+    commit(table, results);
+    assertTableRows(table, record(table, 1L, "narrow", null), record(table, wideKey, "after", "x"));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testCdcDeleteThroughNarrowKeyWriterOfKeyWrittenByWideKeyWriter() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    Schema narrow = table.schema();
+    dynamicWriter.write(cdcRecord(table, narrow, SimpleDataUtil.createInsert(2, "other")), null);
+
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    dynamicWriter.write(
+        cdcRecord(
+            table,
+            table.schema(),
+            GenericRowData.ofKind(RowKind.INSERT, 1L, StringData.fromString("wide"))),
+        null);
+
+    // Without upsert mode a delete carries the whole row; the int-keyed writer finds the row the
+    // long-keyed writer wrote in the shared tracker.
+    dynamicWriter.write(cdcRecord(table, narrow, SimpleDataUtil.createDelete(1, "wide")), null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.POSITION_DELETES);
+
+    commit(table, results);
+    assertTableRows(table, record(table, 2L, "other", null));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertAcrossPromotionOfBucketPartitionedKeyWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    PartitionSpec spec = PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).bucket("id", 4).build();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA, spec);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(5, "before")), null);
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(6, "other")), null);
+
+    // An int and a long hash to the same bucket, so both writers see key 5 in the same partition
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(5L, "after")), null);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .hasSize(1);
+
+    commit(table, results);
+    assertTableRows(table, record(table, 5L, "after", null), record(table, 6L, "other", null));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertAcrossPromotionOfIdentityPartitionedKeyFailsToCommit() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    PartitionSpec spec = PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("id").build();
+    Table table = catalog.createTable(TABLE1, SimpleDataUtil.SCHEMA, spec);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(5, "before")), null);
+
+    // Promoting the identity partition source turns the partition value from Integer(5) into
+    // Long(5). Data files of one spec with both value types cannot be committed together, which is
+    // a limitation of committing, with or without a shared tracker. So the writers keep separate
+    // trackers for the two values and the re-write is not retired by a position delete. Once such
+    // files can be committed, this test should expect a shared tracker instead.
+    table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+    dynamicWriter.write(upsertRecord(table, table.schema(), longKeyRow(5L, "after")), null);
+    assertSeparatePartitionTrackers(dynamicWriter, 2);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .hasSize(2)
+        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+    assertThatThrownBy(() -> commit(table, results))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageStartingWith("Wrong class, expected java.lang.Long, but was java.lang.Integer");
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testCdcUpdateAcrossPromotionOfNonKeyPartitionColumnFailsToCommit() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Schema schema =
+        new Schema(
+            Types.NestedField.optional(1, "id", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()),
+            Types.NestedField.optional(3, "region", Types.IntegerType.get()));
+    PartitionSpec spec = PartitionSpec.builderFor(schema).identity("region").build();
+    Table table = catalog.createTable(TABLE1, schema, spec);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    for (int region : new int[] {5, 6}) {
+      dynamicWriter.write(
+          cdcRecord(
+              table,
+              table.schema(),
+              GenericRowData.ofKind(
+                  RowKind.INSERT, region, StringData.fromString("before"), region)),
+          null);
+    }
+
+    // Promoting the identity partition column, which is not part of the key, turns the partition
+    // values from Integer into Long. The second writer gets other trackers for them, so its
+    // UPDATE_BEFOREs become equality deletes. Data files of one spec with both value types cannot
+    // be committed together, with or without a shared tracker; once they can, this test should
+    // expect a shared tracker instead.
+    table.updateSchema().updateColumn("region", Types.LongType.get()).commit();
+    Schema schemaAfter = table.schema();
+    for (long region : new long[] {5L, 6L}) {
+      dynamicWriter.write(
+          cdcRecord(
+              table,
+              schemaAfter,
+              GenericRowData.ofKind(
+                  RowKind.UPDATE_BEFORE, (int) region, StringData.fromString("before"), region)),
+          null);
+      dynamicWriter.write(
+          cdcRecord(
+              table,
+              schemaAfter,
+              GenericRowData.ofKind(
+                  RowKind.UPDATE_AFTER, (int) region, StringData.fromString("after"), region)),
+          null);
+    }
+
+    // regions 5 and 6, each as an Integer and as a Long
+    assertSeparatePartitionTrackers(dynamicWriter, 4);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .hasSize(2)
+        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+    assertThatThrownBy(() -> commit(table, results))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageStartingWith("Wrong class, expected java.lang.Long, but was java.lang.Integer");
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testCdcUpdateAcrossPromotionOfFloatPartitionColumnFailsToCommit() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Schema schema =
+        new Schema(
+            Types.NestedField.optional(1, "id", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()),
+            Types.NestedField.optional(3, "score", Types.FloatType.get()));
+    PartitionSpec spec = PartitionSpec.builderFor(schema).identity("score").build();
+    Table table = catalog.createTable(TABLE1, schema, spec);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        cdcRecord(
+            table,
+            table.schema(),
+            GenericRowData.ofKind(RowKind.INSERT, 1, StringData.fromString("before"), 1.5f)),
+        null);
+
+    // Promoting the identity partition column turns the partition value from Float to Double
+    table.updateSchema().updateColumn("score", Types.DoubleType.get()).commit();
+    Schema schemaAfter = table.schema();
+    dynamicWriter.write(
+        cdcRecord(
+            table,
+            schemaAfter,
+            GenericRowData.ofKind(RowKind.UPDATE_BEFORE, 1, StringData.fromString("before"), 1.5d)),
+        null);
+    assertSeparatePartitionTrackers(dynamicWriter, 2);
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .hasSize(1)
+        .allMatch(file -> file.content() == FileContent.EQUALITY_DELETES);
+    assertThatThrownBy(() -> commit(table, results))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageStartingWith("Wrong class, expected java.lang.Double, but was java.lang.Float");
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testUpsertAcrossKeyOptionalityChangeKeepsPrivateTrackersWithinCheckpoint() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, REQUIRED_KEY_SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "first")), null);
+
+    // A required key compares nulls differently from an optional one, so the writers of the
+    // schemas after the key was made optional cannot share the first writer's trackers. Each keeps
+    // a private tracker, so they do not retire each other's rows either.
+    table.updateSchema().makeColumnOptional("id").commit();
+    Schema optionalKey = table.schema();
+    dynamicWriter.write(
+        upsertRecord(table, optionalKey, SimpleDataUtil.createRowData(1, "second")), null);
+    dynamicWriter.write(
+        upsertRecord(table, optionalKey, SimpleDataUtil.createRowData(10, "before")), null);
+    table.updateSchema().addColumn("extra", Types.StringType.get()).commit();
+    Schema extraColumn = table.schema();
+    dynamicWriter.write(upsertRecord(table, extraColumn, rowData(10, "after", "x")), null);
+
+    Object trackers = tableTrackers(dynamicWriter);
+    assertThat((Set<?>) hiddenField(trackers, "privateSchemaIds"))
+        .isEqualTo(Sets.newHashSet(optionalKey.schemaId(), extraColumn.schemaId()));
+    assertThat((Set<?>) hiddenField(trackers, "sharingSchemaIds")).isEmpty();
+
+    Collection<DynamicWriteResult> results = dynamicWriter.prepareCommit();
+    assertThat(deleteFiles(results))
+        .filteredOn(file -> file.content() == FileContent.POSITION_DELETES)
+        .isEmpty();
+
+    commit(table, results);
+    assertTableRows(
+        table,
+        SimpleDataUtil.createRecord(1, "first", null),
+        SimpleDataUtil.createRecord(1, "second", null),
+        SimpleDataUtil.createRecord(10, "before", null),
+        SimpleDataUtil.createRecord(10, "after", "x"));
+
+    dynamicWriter.close();
+  }
+
+  @Test
+  void testLaterUpsertRemovesDuplicateLeftByUnsharedTrackers() throws Exception {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    Table table = catalog.createTable(TABLE1, REQUIRED_KEY_SCHEMA);
+    DynamicWriter dynamicWriter = createDynamicWriter(catalog);
+
+    // Writers that cannot share a tracker leave both rows of a key re-written within one
+    // checkpoint: the second writer's equality delete has the same sequence number as the first
+    // writer's data file, so it does not apply to it.
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "first")), null);
+    table.updateSchema().makeColumnOptional("id").commit();
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "second")), null);
+    commit(table, dynamicWriter.prepareCommit());
+    assertTableRows(
+        table, SimpleDataUtil.createRecord(1, "first"), SimpleDataUtil.createRecord(1, "second"));
+
+    // An upsert of the key in a later checkpoint writes an equality delete with a higher sequence
+    // number, which applies to both rows.
+    dynamicWriter.write(
+        upsertRecord(table, table.schema(), SimpleDataUtil.createRowData(1, "third")), null);
+    commit(table, dynamicWriter.prepareCommit());
+    assertTableRows(table, SimpleDataUtil.createRecord(1, "third"));
+
+    dynamicWriter.close();
+  }
+
+  private static Record record(Table table, long id, String data, String extra) {
+    Record record = GenericRecord.create(table.schema());
+    record.setField("id", id);
+    record.setField("data", data);
+    if (table.schema().findField("extra") != null) {
+      record.setField("extra", extra);
+    }
+
+    return record;
+  }
+
+  private static RowData longKeyRow(long id, String data) {
+    return GenericRowData.of(id, StringData.fromString(data));
+  }
+
   private static DynamicRecordInternal upsertRecord(Table table, Schema schema, RowData row) {
     DynamicRecordInternal record = cdcRecord(table, schema, row);
     record.setUpsertMode(true);
@@ -728,6 +1170,27 @@ class TestDynamicWriter extends TestFlinkIcebergSinkBase {
             .hiddenImpl(DynamicWriter.class, "insertedRowTrackers")
             .build(dynamicWriter);
     return trackersField.get();
+  }
+
+  // The trackers of the only table the writer has trackers for
+  private static Object tableTrackers(DynamicWriter dynamicWriter) {
+    Map<?, ?> trackers = insertedRowTrackers(dynamicWriter);
+    assertThat(trackers).hasSize(1);
+    return trackers.values().iterator().next();
+  }
+
+  private static Object hiddenField(Object target, String name) {
+    return DynFields.builder().hiddenImpl(target.getClass(), name).build(target).get();
+  }
+
+  // The same partition values in two types keep separate trackers, the type change was detected,
+  // and no writer was handed a tracker of another writer, so no "share" message is logged
+  private static void assertSeparatePartitionTrackers(
+      DynamicWriter dynamicWriter, int partitionTrackers) {
+    Object trackers = tableTrackers(dynamicWriter);
+    assertThat((Map<?, ?>) hiddenField(trackers, "byPartition")).hasSize(partitionTrackers);
+    assertThat((Boolean) hiddenField(trackers, "warnedPartitionTypes")).isTrue();
+    assertThat((Set<?>) hiddenField(trackers, "sharingSchemaIds")).isEmpty();
   }
 
   private static Collection<DynamicWriteResult> resultsFor(
