@@ -8,6 +8,14 @@ Format: one section per published version, listing its upstream base and every A
 carried on top, each linked to its upstream reference where one exists. The git tag for a version
 is the source of truth for the commit published to Artifactory.
 
+## 1.11.0-affirm-patch.4
+
+- **Base:** `1.11.0-affirm-patch.3`
+
+| Fork PR | Upstream reference | Scope |
+|---|---|---|
+| [Affirm/iceberg#23](https://github.com/Affirm/iceberg/pull/23) | [apache/iceberg#18402](https://github.com/apache/iceberg/issues/18402) (issue; no upstream fix yet) | Stop `SnapshotProducer` from deleting files when a commit fails: `commit()` no longer calls `cleanAll()` on failure, it logs a WARN with the leftover manifest-list paths and rethrows. Fixes the manifest list and manifests of an already-committed snapshot being deleted after a 409 that follows an applied commit (LAKE-7128). The change is in `core`, so it applies to `flink/v2.1`, `flink/v2.0` and `flink/v1.20` alike. Trade-off: files from failed commits remain on storage as unreferenced orphans |
+
 ## 1.11.0-affirm-patch.3
 
 - **Base:** `1.11.0-affirm-patch.2`
