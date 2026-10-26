@@ -1125,7 +1125,8 @@ public class TestMergeAppend extends TestBase {
         files(initialManifest),
         statuses(Status.ADDED));
 
-    assertThat(new File(newManifest.path())).doesNotExist();
+    // a failed commit does not delete files, the catalog may have applied it
+    assertThat(new File(newManifest.path())).exists();
   }
 
   @TestTemplate
@@ -1153,11 +1154,8 @@ public class TestMergeAppend extends TestBase {
     V1Assert.assertEquals(
         "Table should end with last-sequence-number 0", 0, readMetadata().lastSequenceNumber());
 
-    if (formatVersion == 1) {
-      assertThat(new File(newManifest.path())).doesNotExist();
-    } else {
-      assertThat(new File(newManifest.path())).exists();
-    }
+    // a failed commit does not delete files, including the copy of the manifest made for v1
+    assertThat(new File(newManifest.path())).exists();
   }
 
   @TestTemplate

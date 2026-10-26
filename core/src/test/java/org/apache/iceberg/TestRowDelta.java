@@ -1283,8 +1283,8 @@ public class TestRowDelta extends TestBase {
         .isInstanceOf(ValidationException.class)
         .hasMessageStartingWith("Cannot commit, missing data files");
 
-    // we should clean up 1 manifest list and 2 delete manifests
-    assertThat(deletedFiles).hasSize(3);
+    // a failed commit does not delete files, so nothing is cleaned up
+    assertThat(deletedFiles).isEmpty();
   }
 
   @TestTemplate

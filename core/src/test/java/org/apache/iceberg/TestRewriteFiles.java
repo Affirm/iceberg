@@ -408,11 +408,10 @@ public class TestRewriteFiles extends TestBase {
         .isInstanceOf(CommitFailedException.class)
         .hasMessage("Injected failure");
 
-    assertThat(new File(manifest1.path())).doesNotExist();
-    assertThat(new File(manifest2.path())).doesNotExist();
-
-    // As commit failed all the manifests added with rewrite should be cleaned up
-    assertThat(listManifestFiles()).hasSize(1);
+    // A failed commit does not delete files, so the manifests added with rewrite remain
+    assertThat(new File(manifest1.path())).exists();
+    assertThat(new File(manifest2.path())).exists();
+    assertThat(listManifestFiles()).hasSize(3);
   }
 
   @TestTemplate
@@ -475,12 +474,11 @@ public class TestRewriteFiles extends TestBase {
         .isInstanceOf(CommitFailedException.class)
         .hasMessage("Injected failure");
 
-    assertThat(new File(manifest1.path())).doesNotExist();
-    assertThat(new File(manifest2.path())).doesNotExist();
-    assertThat(new File(manifest3.path())).doesNotExist();
-
-    // As commit failed all the manifests added with rewrite should be cleaned up
-    assertThat(listManifestFiles()).hasSize(2);
+    // A failed commit does not delete files, so the manifests added with rewrite remain
+    assertThat(new File(manifest1.path())).exists();
+    assertThat(new File(manifest2.path())).exists();
+    assertThat(new File(manifest3.path())).exists();
+    assertThat(listManifestFiles()).hasSize(5);
   }
 
   @TestTemplate

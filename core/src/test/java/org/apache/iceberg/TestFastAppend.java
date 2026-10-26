@@ -336,7 +336,8 @@ public class TestFastAppend extends TestBase {
         .isInstanceOf(CommitFailedException.class)
         .hasMessage("Injected failure");
 
-    assertThat(new File(newManifest.path())).doesNotExist();
+    // a failed commit does not delete files, the catalog may have applied it
+    assertThat(new File(newManifest.path())).exists();
   }
 
   @TestTemplate
@@ -385,11 +386,8 @@ public class TestFastAppend extends TestBase {
         .isInstanceOf(CommitFailedException.class)
         .hasMessage("Injected failure");
 
-    if (formatVersion == 1) {
-      assertThat(new File(newManifest.path())).doesNotExist();
-    } else {
-      assertThat(new File(newManifest.path())).exists();
-    }
+    // a failed commit does not delete files, including the copy of the manifest made for v1
+    assertThat(new File(newManifest.path())).exists();
   }
 
   @TestTemplate
