@@ -136,6 +136,7 @@ public class SparkCatalog extends BaseCatalog {
   private ViewCatalog asViewCatalog = null;
   private String[] defaultNamespace = null;
   private HadoopTables tables;
+  private CatalogLoadObserver loadObserver = CatalogLoadObserver.NOOP;
 
   /**
    * Build an Iceberg {@link Catalog} to be used by this Spark catalog adapter.
@@ -165,11 +166,17 @@ public class SparkCatalog extends BaseCatalog {
 
   @Override
   public Table loadTable(Identifier ident) throws NoSuchTableException {
+    Table table;
     try {
-      return load(ident);
+      table = load(ident);
     } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
       throw new NoSuchTableException(ident);
     }
+
+    // Observe only: the observer is handed the table this call already loaded. It must not
+    // load, refresh or invalidate anything, and a failure in it never fails the load.
+    CatalogLoadObservers.notifySafely(loadObserver, catalogName, ident, table);
+    return table;
   }
 
   @Override
@@ -775,6 +782,8 @@ public class SparkCatalog extends BaseCatalog {
     EnvironmentContext.put(
         EnvironmentContext.ENGINE_VERSION, sparkSession.sparkContext().version());
     EnvironmentContext.put(CatalogProperties.APP_ID, sparkSession.sparkContext().applicationId());
+
+    this.loadObserver = CatalogLoadObservers.load(name, options);
   }
 
   @Override
