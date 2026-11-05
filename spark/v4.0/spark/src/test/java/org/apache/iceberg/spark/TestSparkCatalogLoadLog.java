@@ -41,6 +41,9 @@ import org.slf4j.LoggerFactory;
 @ExtendWith(ParameterizedTestExtension.class)
 public class TestSparkCatalogLoadLog extends CatalogTestBase {
   private static final AtomicInteger CATALOG_COUNTER = new AtomicInteger();
+  private static final String UNSET_ENV = "ICEBERG_TEST_DEFINITELY_UNSET_VAR";
+  private static final String CONF_KEY = "spark.test.load.log.conf";
+  private static final String EMPTY_CONF_KEY = "spark.test.load.log.empty";
 
   private LoadLogCapture capture = null;
 
@@ -140,11 +143,25 @@ public class TestSparkCatalogLoadLog extends CatalogTestBase {
   }
 
   @TestTemplate
-  public void selectLogsOneLineWithTheExpectedFields() {
+  public void selectLogsOneLineWithTheExpectedFields() throws NoSuchTableException {
     assertThat(sql("SELECT * FROM %s", tableName)).containsExactly(row(1L, "a"));
 
     assertThat(lines()).hasSize(1);
     String line = lines().get(0);
+    String loadedName =
+        tableCatalog().loadTable(Identifier.of(new String[] {"default"}, "table")).name();
+    // without the extra-field options the line is exactly these fields
+    assertThat(line)
+        .isEqualTo(
+            SparkCatalog.LOAD_LOG_PREFIX
+                + " catalog="
+                + catalogName
+                + " ident=default.table table="
+                + loadedName
+                + " app-id="
+                + spark.sparkContext().applicationId()
+                + " thread="
+                + Thread.currentThread().getName());
     assertThat(line)
         .startsWith(
             SparkCatalog.LOAD_LOG_PREFIX
@@ -242,6 +259,94 @@ public class TestSparkCatalogLoadLog extends CatalogTestBase {
 
     // the line was attempted each time, and threw
     assertThat(lines()).hasSizeGreaterThanOrEqualTo(3);
+  }
+
+  @TestTemplate
+  public void envKeysAddSetVariablesInOrderAndOmitUnsetOnes() {
+    String path = System.getenv("PATH");
+    String home = System.getenv("HOME");
+    assertThat(path).as("PATH must be set for this test").isNotEmpty();
+    assertThat(home).as("HOME must be set for this test").isNotEmpty();
+    assertThat(System.getenv(UNSET_ENV)).isNull();
+
+    // whitespace around names and empty entries are ignored
+    String line = lineWithOptions(" PATH , ," + UNSET_ENV + ",, HOME ", null);
+
+    assertThat(line)
+        .endsWith(threadField() + " env.PATH=" + path + " env.HOME=" + home)
+        .doesNotContain(UNSET_ENV, "=null", "conf.");
+  }
+
+  @TestTemplate
+  public void confKeysAddSetKeysInOrderAndOmitUnsetOrEmptyOnes() {
+    String appName = spark.conf().get("spark.app.name");
+    String line =
+        lineWithOptions(
+            null,
+            CONF_KEY + ", spark.test.load.log.unset,," + EMPTY_CONF_KEY + " , spark.app.name");
+
+    assertThat(line)
+        .endsWith(threadField() + " conf." + CONF_KEY + "=somevalue conf.spark.app.name=" + appName)
+        .doesNotContain("spark.test.load.log.unset", EMPTY_CONF_KEY, "=null", "env.");
+  }
+
+  @TestTemplate
+  public void envFieldsComeBeforeConfFieldsInTheGivenOrder() {
+    String line = lineWithOptions("HOME,PATH", "spark.app.name," + CONF_KEY);
+
+    assertThat(line)
+        .endsWith(
+            threadField()
+                + " env.HOME="
+                + System.getenv("HOME")
+                + " env.PATH="
+                + System.getenv("PATH")
+                + " conf.spark.app.name="
+                + spark.conf().get("spark.app.name")
+                + " conf."
+                + CONF_KEY
+                + "=somevalue");
+  }
+
+  private static String threadField() {
+    return " thread=" + Thread.currentThread().getName();
+  }
+
+  /**
+   * Creates a new catalog with the line enabled and the given extra-field options, reads its table
+   * once, and returns the line written for that read. The Spark configuration keys used by the
+   * tests are set before the catalog is initialized, because they are read only at initialize.
+   */
+  private String lineWithOptions(String envKeys, String confKeys) {
+    spark.conf().set(CONF_KEY, "somevalue");
+    spark.conf().set(EMPTY_CONF_KEY, "");
+    try {
+      File catalogWarehouse = temp.resolve("fields-" + CATALOG_COUNTER.incrementAndGet()).toFile();
+      String name = newHadoopCatalog("loadlog_fields", catalogWarehouse, true);
+      String conf = "spark.sql.catalog." + name + ".";
+      if (envKeys != null) {
+        spark.conf().set(conf + SparkCatalog.LOAD_LOG_ENV_KEYS, envKeys);
+      }
+
+      if (confKeys != null) {
+        spark.conf().set(conf + SparkCatalog.LOAD_LOG_CONF_KEYS, confKeys);
+      }
+
+      sql("CREATE NAMESPACE IF NOT EXISTS %s.db", name);
+      sql("CREATE TABLE %s.db.tbl (id BIGINT) USING iceberg", name);
+      int before = capture.linesFor(name, "db.tbl").size();
+      sql("SELECT * FROM %s.db.tbl", name);
+
+      List<String> lines = capture.linesFor(name, "db.tbl");
+      assertThat(lines).hasSize(before + 1);
+      String line = lines.get(lines.size() - 1);
+      assertThat(line).startsWith(SparkCatalog.LOAD_LOG_PREFIX + " catalog=" + name + " ");
+      assertThat(line.split(" thread=", -1)).hasSize(2);
+      return line;
+    } finally {
+      spark.conf().unset(CONF_KEY);
+      spark.conf().unset(EMPTY_CONF_KEY);
+    }
   }
 
   private String newHadoopCatalog(String prefix, File catalogWarehouse, boolean loadLogEnabled) {
