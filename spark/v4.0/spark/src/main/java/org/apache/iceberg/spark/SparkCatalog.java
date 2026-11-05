@@ -28,6 +28,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -91,6 +92,8 @@ import org.apache.spark.sql.connector.catalog.ViewInfo;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A Spark TableCatalog implementation that wraps an Iceberg {@link Catalog}.
@@ -129,6 +132,29 @@ public class SparkCatalog extends BaseCatalog {
   private static final Pattern SNAPSHOT_ID = Pattern.compile("snapshot_id_(\\d+)");
   private static final Pattern BRANCH = Pattern.compile("branch_(.*)");
   private static final Pattern TAG = Pattern.compile("tag_(.*)");
+  private static final Logger LOG = LoggerFactory.getLogger(SparkCatalog.class);
+
+  /** Catalog option: when true, write one INFO line per successful loadTable. Off by default. */
+  static final String LOAD_LOG_ENABLED = "load-log-enabled";
+
+  /**
+   * Catalog option: comma-separated environment variable names to add to the load line as {@code
+   * env.<NAME>=<value>}. Variables that are unset or empty are omitted. Read once at initialize.
+   */
+  static final String LOAD_LOG_ENV_KEYS = "load-log-env-keys";
+
+  /**
+   * Catalog option: comma-separated Spark configuration keys to add to the load line as {@code
+   * conf.<key>=<value>}. Keys that are unset or empty are omitted. Read once at initialize from the
+   * session configuration, so later changes to the Spark configuration are not picked up.
+   */
+  static final String LOAD_LOG_CONF_KEYS = "load-log-conf-keys";
+
+  static final String LOAD_LOG_PREFIX = "iceberg-catalog-load";
+
+  // Log the first failure to write the load line, then one in every 1000, so it cannot flood logs.
+  private static final long LOAD_LOG_FAILURE_EVERY = 1000;
+  private static final AtomicLong LOAD_LOG_FAILURES = new AtomicLong();
   private static final String REWRITE = "rewrite";
 
   private String catalogName = null;
@@ -138,6 +164,9 @@ public class SparkCatalog extends BaseCatalog {
   private ViewCatalog asViewCatalog = null;
   private String[] defaultNamespace = null;
   private HadoopTables tables;
+  private boolean loadLogEnabled = false;
+  private String appId = null;
+  private String loadLogExtraFields = "";
 
   /**
    * Build an Iceberg {@link Catalog} to be used by this Spark catalog adapter.
@@ -167,11 +196,99 @@ public class SparkCatalog extends BaseCatalog {
 
   @Override
   public Table loadTable(Identifier ident) throws NoSuchTableException {
+    Table table;
     try {
-      return load(ident);
+      table = load(ident);
     } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
       throw new NoSuchTableException(ident);
     }
+
+    if (loadLogEnabled) {
+      logLoad(ident, table);
+    }
+
+    return table;
+  }
+
+  /**
+   * Writes one INFO line for a table that this catalog has just loaded. Example:
+   *
+   * <pre>
+   * iceberg-catalog-load catalog=my_catalog ident=db.events table=my_catalog.db.events
+   *   app-id=app-123 thread=main env.JOB_NAME=nightly-report conf.spark.app.name=report
+   * </pre>
+   *
+   * <p>{@code snapshot-id} or {@code ref} is only present when the identifier itself selects one,
+   * for example {@code db.events.branch_audit}. {@code VERSION AS OF} and {@code TIMESTAMP AS OF}
+   * are applied after this load, so they are not shown.
+   *
+   * <p>{@code env.*} fields (from {@code load-log-env-keys}) and then {@code conf.*} fields (from
+   * {@code load-log-conf-keys}) follow, each in the order given. They are built once at initialize;
+   * unset or empty values are omitted.
+   *
+   * <p>Safety rules: this runs after the load, on the calling thread, and only reads the table it
+   * is handed, through in-memory accessors. It never calls loadTable, refresh or invalidateTable
+   * and does no I/O beyond the logger call. Any exception or linkage error is caught, so writing
+   * the line can never fail a load.
+   */
+  private void logLoad(Identifier ident, Table table) {
+    try {
+      if (!LOG.isInfoEnabled()) {
+        return;
+      }
+
+      StringBuilder line = new StringBuilder(LOAD_LOG_PREFIX);
+      line.append(" catalog=").append(catalogName);
+      line.append(" ident=").append(ident);
+      line.append(" table=").append(table.name());
+      if (table instanceof SparkTable) {
+        SparkTable sparkTable = (SparkTable) table;
+        if (sparkTable.snapshotId() != null) {
+          line.append(" snapshot-id=").append(sparkTable.snapshotId());
+        } else if (sparkTable.branch() != null) {
+          line.append(" ref=").append(sparkTable.branch());
+        }
+      }
+
+      line.append(" app-id=").append(appId);
+      line.append(" thread=").append(Thread.currentThread().getName());
+      line.append(loadLogExtraFields);
+      LOG.info(line.toString());
+    } catch (RuntimeException | LinkageError e) {
+      long failures = LOAD_LOG_FAILURES.incrementAndGet();
+      if (failures == 1 || failures % LOAD_LOG_FAILURE_EVERY == 0) {
+        try {
+          LOG.warn("Cannot write table load log line ({} failures so far)", failures, e);
+        } catch (RuntimeException | LinkageError ignored) {
+          // the logger itself is failing; the load must still succeed
+        }
+      }
+    }
+  }
+
+  /**
+   * Builds the fixed {@code env.*} and {@code conf.*} part of the load line once, at initialize.
+   * Unset or empty values are omitted, so a missing variable never appears as {@code null}.
+   */
+  private static String loadLogExtraFields(
+      CaseInsensitiveStringMap options, SparkSession sparkSession) {
+    Splitter keys = COMMA.trimResults().omitEmptyStrings();
+    StringBuilder fields = new StringBuilder();
+    for (String name : keys.split(options.getOrDefault(LOAD_LOG_ENV_KEYS, ""))) {
+      String value = System.getenv(name);
+      if (value != null && !value.isEmpty()) {
+        fields.append(" env.").append(name).append('=').append(value);
+      }
+    }
+
+    for (String key : keys.split(options.getOrDefault(LOAD_LOG_CONF_KEYS, ""))) {
+      scala.Option<String> value = sparkSession.conf().getOption(key);
+      if (value.isDefined() && !value.get().isEmpty()) {
+        fields.append(" conf.").append(key).append('=').append(value.get());
+      }
+    }
+
+    return fields.toString();
   }
 
   @Override
@@ -777,6 +894,17 @@ public class SparkCatalog extends BaseCatalog {
     EnvironmentContext.put(
         EnvironmentContext.ENGINE_VERSION, sparkSession.sparkContext().version());
     EnvironmentContext.put(CatalogProperties.APP_ID, sparkSession.sparkContext().applicationId());
+
+    this.loadLogEnabled = PropertyUtil.propertyAsBoolean(options, LOAD_LOG_ENABLED, false);
+    this.appId = sparkSession.sparkContext().applicationId();
+    if (loadLogEnabled) {
+      try {
+        this.loadLogExtraFields = loadLogExtraFields(options, sparkSession);
+      } catch (RuntimeException e) {
+        LOG.warn("Catalog {}: cannot read extra load log fields; logging without them", name, e);
+        this.loadLogExtraFields = "";
+      }
+    }
   }
 
   @Override
